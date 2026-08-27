@@ -200,6 +200,14 @@ HOP = {"host", "accept-encoding", "content-length", "connection", "keep-alive",
        "transfer-encoding", "upgrade"}
 
 
+def _close(resp):
+    """Release an upstream response -- an HTTPError body holds a socket too."""
+    try:
+        resp.close()
+    except Exception:
+        pass
+
+
 class Credential(object):
     """Holds the live token. Re-read on a 401 so a long session survives the
     access token rolling underneath it -- Claude Code on this machine refreshes
@@ -256,10 +264,14 @@ def make_proxy_handler(cred, capability, verbose, allowed):
             fwd = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
             fwd["Accept-Encoding"] = "identity"
 
+            # Strip *every* credential header the sprite sent, not just the
+            # first -- `presented or fwd.pop(k)` would short-circuit and
+            # forward a second one upstream alongside the real token.
             presented = ""
             for k in list(fwd):
                 if k.lower() in ("authorization", "x-api-key"):
-                    presented = presented or fwd.pop(k)
+                    v = fwd.pop(k)
+                    presented = presented or v
             presented = presented[7:] if presented.lower().startswith("bearer ") else presented
 
             if not presented or presented.strip() != capability:
@@ -291,6 +303,7 @@ def make_proxy_handler(cred, capability, verbose, allowed):
             resp, code, err = attempt()
             if code == 401 and cred.refresh():
                 log("upstream 401 -- reloaded credential, retrying")
+                _close(resp)          # the 401 body still owns a socket
                 fwd["Authorization"] = "Bearer " + cred.token
                 resp, code, err = attempt()
             if err is not None:
@@ -306,14 +319,17 @@ def make_proxy_handler(cred, capability, verbose, allowed):
             self.end_headers()
 
             # Streamed verbatim so SSE arrives token-by-token, not buffered.
-            while True:
-                chunk = resp.read(4096)
-                if not chunk:
-                    break
-                self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+            try:
+                while True:
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        break
+                    self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
+            finally:
+                _close(resp)
 
         do_GET = do_POST = do_PUT = do_DELETE = _proxy
 
@@ -323,6 +339,16 @@ def make_proxy_handler(cred, capability, verbose, allowed):
 class ProxyServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        """A client hanging up mid-request is routine -- `claude` does it on
+        every Ctrl-C. socketserver's default would dump a traceback for it.
+        Anything genuinely unexpected gets one line, never headers or bodies."""
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError,
+                            ConnectionAbortedError, socket.timeout)):
+            return
+        log("connection error: %r" % (exc,))
 
 
 # --------------------------------------------------------------------------
