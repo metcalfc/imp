@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""sprite-max-proxy — lend a sprite your Claude Max subscription without ever
-giving it the credential.
+"""imp — lend a sprite your Claude Max subscription without ever giving
+it the credential.
 
 The token stays on this machine. A local proxy holds it and injects it into
 every request; the sprite gets only a per-session capability string and a URL
@@ -71,7 +71,7 @@ RELAY_IDLE_TIMEOUT = 30.0
 
 
 def log(*a):
-    sys.stderr.write("[sprite-max-proxy] " + " ".join(str(x) for x in a) + "\n")
+    sys.stderr.write("[imp] " + " ".join(str(x) for x in a) + "\n")
     sys.stderr.flush()
 
 
@@ -122,7 +122,7 @@ def _extract_token(blob):
 def load_credential():
     """Return (token, human-readable source). Never logged, never written out.
 
-    Preferred: the dedicated setup-token minted by sprite-max-auth, which is
+    Preferred: the dedicated setup-token minted by imp-auth, which is
     long-lived and inference-only. Falls back to this machine's live Claude
     login, which works but carries a short-lived access token -- see --help.
     """
@@ -131,8 +131,8 @@ def load_credential():
 
     if darwin:
         candidates = [
-            (["security", "find-generic-password", "-s", "sprite-max-oauth",
-              "-a", user, "-w"], "macOS keychain (sprite-max-oauth, setup-token)"),
+            (["security", "find-generic-password", "-s", "imp-oauth",
+              "-a", user, "-w"], "macOS keychain (imp-oauth, setup-token)"),
             (["security", "find-generic-password", "-s", "Claude Code-credentials",
               "-a", user, "-w"], "macOS keychain (live Claude login)"),
         ]
@@ -149,7 +149,7 @@ def load_credential():
                 tok = _extract_token(f.read())
             if tok:
                 return tok, path
-        for service in ("sprite-max-oauth", "Claude Code-credentials"):
+        for service in ("imp-oauth", "Claude Code-credentials"):
             r = _run(["secret-tool", "lookup", "service", service])
             if r is not None and r.returncode == 0:
                 tok = _extract_token(r.stdout)
@@ -163,7 +163,7 @@ def load_credential():
     raise SystemExit(
         "no Claude credential found.\n"
         "  Mint a dedicated one:  claude setup-token   (then store it as\n"
-        "  'sprite-max-oauth' in your keychain), or just log in with `claude`."
+        "  'imp-oauth' in your keychain), or just log in with `claude`."
     )
 
 
@@ -578,7 +578,7 @@ def resolve_sprite(name):
     if os.path.exists(".sprite"):
         return ""  # the sprite CLI reads it, exactly as it would anyway
     die("no sprite selected.",
-        "  sprite-max-proxy -s NAME",
+        "  imp -s NAME",
         "or run `sprite use NAME` in this directory first.")
 
 
@@ -642,7 +642,7 @@ else:
         data.pop("env", None)
 
 os.makedirs(os.path.dirname(path), exist_ok=True)
-tmp = path + ".smproxy.tmp"
+tmp = path + ".imp.tmp"
 with open(tmp, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
@@ -673,7 +673,7 @@ def write_sprite_settings(sprite, base_url, capability):
 
 def main():
     ap = argparse.ArgumentParser(
-        prog="sprite-max-proxy",
+        prog="imp",
         description="Lend a sprite your Claude Max subscription without giving "
                     "it the credential.",
         epilog="The credential never leaves this machine. Stop the proxy "

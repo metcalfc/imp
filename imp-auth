@@ -1,5 +1,5 @@
 #!/bin/bash
-# sprite-max-auth — forward a Claude Max subscription token to Fly Sprites.
+# imp-auth — forward a Claude Max subscription token to Fly Sprites.
 #
 # Sprites ship Claude Code preinstalled but unauthenticated. This mints a
 # long-lived, INFERENCE-ONLY OAuth token from your Max subscription (via
@@ -18,8 +18,8 @@
 
 set -euo pipefail
 
-KEYCHAIN_SERVICE="sprite-max-oauth"
-STATE_DIR="$HOME/.config/sprite-max-auth"
+KEYCHAIN_SERVICE="imp-oauth"
+STATE_DIR="$HOME/.config/imp"
 ENV_KEY="CLAUDE_CODE_OAUTH_TOKEN"
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -27,7 +27,7 @@ info() { printf '%s\n' "$*" >&2; }
 
 usage() {
   cat <<'USAGE'
-sprite-max-auth <command> [options]
+imp-auth <command> [options]
 
 Commands:
   mint                  Instructions + run `claude setup-token`, then store
@@ -118,8 +118,8 @@ push_one() {
   rhome=$(sprite exec $sf -- printenv HOME 2>/dev/null | tr -d '\r\n') || true
   [ -n "$rhome" ] || die "$(label "$s"): could not determine remote HOME"
 
-  tokfile=$(mktemp "${TMPDIR:-/tmp}/smauth-tok.XXXXXX")
-  mergefile=$(mktemp "${TMPDIR:-/tmp}/smauth-merge.XXXXXX")
+  tokfile=$(mktemp "${TMPDIR:-/tmp}/imp-auth-tok.XXXXXX")
+  mergefile=$(mktemp "${TMPDIR:-/tmp}/imp-auth-merge.XXXXXX")
   trap 'rm -f "$tokfile" "$mergefile"' EXIT INT TERM
   chmod 600 "$tokfile"
 
@@ -151,7 +151,7 @@ except ValueError:
 data.setdefault("env", {})["CLAUDE_CODE_OAUTH_TOKEN"] = token
 
 os.makedirs(os.path.dirname(settings), exist_ok=True)
-tmp = settings + ".smauth.tmp"
+tmp = settings + ".imp-auth.tmp"
 with open(tmp, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
@@ -162,13 +162,13 @@ PY_EOF
 
   sprite exec $sf -- mkdir -p "$rhome/.claude" >/dev/null
   sprite file push $sf "$tokfile" "$rhome/.claude/.max-token.stage" >/dev/null
-  sprite file push $sf "$mergefile" "/tmp/smauth-merge.py" >/dev/null
+  sprite file push $sf "$mergefile" "/tmp/imp-auth-merge.py" >/dev/null
   local out
-  out=$(sprite exec $sf -- python3 /tmp/smauth-merge.py 2>&1) || {
-    sprite exec $sf -- rm -f /tmp/smauth-merge.py "$rhome/.claude/.max-token.stage" >/dev/null 2>&1 || true
+  out=$(sprite exec $sf -- python3 /tmp/imp-auth-merge.py 2>&1) || {
+    sprite exec $sf -- rm -f /tmp/imp-auth-merge.py "$rhome/.claude/.max-token.stage" >/dev/null 2>&1 || true
     die "$(label "$s"): $out"
   }
-  sprite exec $sf -- rm -f /tmp/smauth-merge.py >/dev/null 2>&1 || true
+  sprite exec $sf -- rm -f /tmp/imp-auth-merge.py >/dev/null 2>&1 || true
   rm -f "$tokfile" "$mergefile"
   trap - EXIT INT TERM
   info "$(label "$s"): $out"

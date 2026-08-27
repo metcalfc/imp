@@ -1,10 +1,10 @@
-# sprite-max-proxy
+# imp
 
 Lend a [Fly Sprite](https://docs.sprites.dev) your Claude Max subscription
 without ever giving it the credential.
 
 ```
-sprite-max-proxy -s my-sprite
+imp -s my-sprite
 ```
 
 `claude` on the sprite now runs on your Max subscription. Ctrl-C revokes it
@@ -120,7 +120,7 @@ stateDiagram-v2
     direction LR
     [*] --> Idle
 
-    Idle --> Active: sprite-max-proxy starts
+    Idle --> Active: imp starts
 
     Active --> Idle: Ctrl-C
     Active --> Orphaned: link drops / kill -9
@@ -228,8 +228,8 @@ Anything else is refused with a 403 **before** the real token is attached, and
 logged locally:
 
 ```
-[sprite-max-proxy] rejected: path /v1/organizations/me is not on the allowlist
-[sprite-max-proxy] rejected: path /v1/api_keys is not on the allowlist
+[imp] rejected: path /v1/organizations/me is not on the allowlist
+[imp] rejected: path /v1/api_keys is not on the allowlist
 ```
 
 Request targets are normalized first, and anything whose normal form differs
@@ -240,7 +240,7 @@ Absolute-URL targets are refused for the same reason.
 Widen it with `--allow`, which takes globs and repeats:
 
 ```
-sprite-max-proxy -s my-sprite --allow '/v1/messages/batches*'
+imp -s my-sprite --allow '/v1/messages/batches*'
 ```
 
 `--allow-any-path` turns the check off entirely. It is the wrong default and
@@ -252,7 +252,7 @@ Checked in order, first hit wins. Nothing is ever written back.
 
 | Platform | Source |
 |---|---|
-| macOS | keychain `sprite-max-oauth` — a dedicated `claude setup-token`, **preferred** |
+| macOS | keychain `imp-oauth` — a dedicated `claude setup-token`, **preferred** |
 | macOS | keychain `Claude Code-credentials` — your live login |
 | Linux | `~/.claude/.credentials.json` |
 | Linux | `secret-tool lookup service …` |
@@ -272,7 +272,7 @@ argv and writes nothing to the sprite's disk.
 ## Usage
 
 ```
-sprite-max-proxy [-s SPRITE] [-p REMOTE_PORT] [--no-settings]
+imp [-s SPRITE] [-p REMOTE_PORT] [--no-settings]
                  [--allow GLOB] [--allow-any-path] [-v]
 
   -s, --sprite        sprite name (default: the one `sprite use` selected in
@@ -287,7 +287,7 @@ sprite-max-proxy [-s SPRITE] [-p REMOTE_PORT] [--no-settings]
 
 ## See also
 
-`sprite-max-auth` in this repo is the earlier design — it pushes a real token
+`imp-auth` in this repo is the earlier design — it pushes a real token
 into the sprite's `settings.json` and leaves it there. It is the right tool only
 when you need a sprite to keep working while you are disconnected, and it
 carries every row in the left column of the table above.
