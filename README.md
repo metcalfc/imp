@@ -371,6 +371,14 @@ blob of every byte value is round-tripped in both directions to hold the 8-bit
 clean claim honest, plus the orphan watchdog is timed out for real to confirm
 it frees the port on its own.
 
+`imp-auth` is covered too. It is bash, and it embeds three python programs
+that shellcheck cannot see inside, so the tests extract each one and run it
+against a temporary HOME standing in for the sprite: the token is installed at
+mode 0600, the staged copy is consumed, unrelated settings survive, invalid
+JSON is refused, and `remove` replaces `settings.json` by rename rather than
+rewriting it in place — asserted by the inode changing, which is the only
+thing that actually distinguishes the two.
+
 CI runs them on Linux and macOS against Python 3.9 through 3.13, alongside
 `shellcheck` and `bash -n` on `imp-auth`.
 

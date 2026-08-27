@@ -124,17 +124,30 @@ push_one() {
   rhome=$(sprite exec $sf -- printenv HOME 2>/dev/null | tr -d '\r\n') || true
   [ -n "$rhome" ] || die "$(label "$s"): could not determine remote HOME"
 
-  tokfile=$(mktemp "${TMPDIR:-/tmp}/imp-auth-tok.XXXXXX")
-  mergefile=$(mktemp "${TMPDIR:-/tmp}/imp-auth-merge.XXXXXX")
-  trap 'rm -f "$tokfile" "$mergefile"' EXIT INT TERM
-  chmod 600 "$tokfile"
+  # `set -e` does NOT apply in here. for_each calls this as `"$fn" "$t" || rc=1`,
+  # and bash disables errexit for the whole of a function whose status is
+  # tested. Every fallible command below is therefore checked by hand -- and
+  # must stay that way. Without it a failed push of the merge script would
+  # fall through to executing whatever stale copy is at that path.
+  tokfile=$(mktemp "${TMPDIR:-/tmp}/imp-auth-tok.XXXXXX") \
+    || die "$(label "$s"): could not create a temp file"
+  mergefile=$(mktemp "${TMPDIR:-/tmp}/imp-auth-merge.XXXXXX") \
+    || die "$(label "$s"): could not create a temp file"
+  # EXIT does the cleanup; INT/TERM must exit rather than fall through, or a
+  # signal between commands deletes the files and carries on without them.
+  trap 'rm -f "$tokfile" "$mergefile"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  chmod 600 "$tokfile" || die "$(label "$s"): could not secure the temp file"
 
   # The token goes over as a file, never as argv, so it stays out of the
   # sprite's process list and out of any control-plane command logging.
-  security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" -w > "$tokfile"
+  security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" -w > "$tokfile" \
+    || die "$(label "$s"): could not read the token from the keychain"
+  [ -s "$tokfile" ] || die "$(label "$s"): keychain returned an empty token"
 
   cat > "$mergefile" <<'PY_EOF'
-import json, os, sys
+import json, os, sys, tempfile
 
 home = os.path.expanduser("~")
 settings = os.path.join(home, ".claude", "settings.json")
@@ -156,19 +169,36 @@ except ValueError:
 
 data.setdefault("env", {})["CLAUDE_CODE_OAUTH_TOKEN"] = token
 
-os.makedirs(os.path.dirname(settings), exist_ok=True)
-tmp = settings + ".imp-auth.tmp"
-with open(tmp, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
-os.chmod(tmp, 0o600)
-os.replace(tmp, settings)
+d = os.path.dirname(settings)
+os.makedirs(d, exist_ok=True)
+# mkstemp, not open(tmp, "w"): a fixed name follows a pre-existing symlink and
+# is created with the default mode, so the token would be readable in the
+# window before chmod. This descriptor is 0600 from the start.
+fd, tmp = tempfile.mkstemp(prefix=".imp-auth.", suffix=".tmp", dir=d)
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, settings)
+except BaseException:
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    raise
 print("installed")
 PY_EOF
 
-  sprite exec $sf -- mkdir -p "$rhome/.claude" >/dev/null
-  sprite file push $sf "$tokfile" "$rhome/.claude/.max-token.stage" >/dev/null
-  sprite file push $sf "$mergefile" "/tmp/imp-auth-merge.py" >/dev/null
+  sprite exec $sf -- mkdir -p "$rhome/.claude" >/dev/null \
+    || die "$(label "$s"): could not create ~/.claude on the sprite"
+  # Merge script first: if the token push fails after this, there is no stale
+  # script waiting to be run against a leftover stage file.
+  sprite file push $sf "$mergefile" "/tmp/imp-auth-merge.py" >/dev/null \
+    || die "$(label "$s"): could not push the merge script"
+  sprite file push $sf "$tokfile" "$rhome/.claude/.max-token.stage" >/dev/null || {
+    sprite exec $sf -- rm -f /tmp/imp-auth-merge.py >/dev/null 2>&1 || true
+    die "$(label "$s"): could not push the token"
+  }
   local out
   out=$(sprite exec $sf -- python3 /tmp/imp-auth-merge.py 2>&1) || {
     sprite exec $sf -- rm -f /tmp/imp-auth-merge.py "$rhome/.claude/.max-token.stage" >/dev/null 2>&1 || true
@@ -249,14 +279,26 @@ main() {
       remove_one() {
         local sf; sf=$(sflag "$1")
         sprite exec $sf -- python3 -c '
-import json, os
+import json, os, tempfile
 p = os.path.expanduser("~/.claude/settings.json")
-d = json.load(open(p))
+with open(p) as f:
+    d = json.load(f)
 env = d.get("env", {})
 if env.pop("CLAUDE_CODE_OAUTH_TOKEN", None) is None:
     print("no token present"); raise SystemExit
 if not env: d.pop("env", None)
-json.dump(d, open(p, "w"), indent=2)
+# open(p, "w") truncates before serialising: an interruption there destroys
+# settings unrelated to us. Write beside it and rename.
+fd, tmp = tempfile.mkstemp(prefix=".imp-auth.", suffix=".tmp", dir=os.path.dirname(p))
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, p)
+except BaseException:
+    try: os.remove(tmp)
+    except OSError: pass
+    raise
 print("token removed")' 2>&1 | while IFS= read -r l; do info "$(label "$1"): $l"; done
       }
       for_each remove_one ;;
