@@ -786,11 +786,39 @@ def ssh_argv(sprite, remote_cmd):
     ]
 
 
+# Compare-and-swap on the capability, which is already unique per session.
+# Without it, a second imp against the same sprite (only possible with -p,
+# since the relay's bind on the default port already refuses a collision)
+# silently repoints settings.json at itself, and whichever session exits
+# first strips the env block out from under the other.
+#
+# A capability that is not ours is only worth respecting if the session
+# behind it still exists, and this script runs on the sprite -- where that
+# question is answerable by connecting to the port the pointer names. A
+# crashed session leaves an inert pointer and nothing listening, so it is
+# taken over silently rather than blocking every future run.
 SETTINGS_SCRIPT = r'''
-import json, os, sys
+import json, os, socket, sys, tempfile
 
 base_url = sys.stdin.readline().strip()
 capability = sys.stdin.readline().strip()
+
+
+def holder_is_live(url):
+    """Is anything actually listening on the port this pointer names?"""
+    try:
+        port = int(url.rsplit(":", 1)[-1])
+    except (ValueError, AttributeError):
+        return False          # not a pointer imp wrote; nothing to protect
+    s = socket.socket()
+    s.settimeout(0.5)
+    try:
+        s.connect(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
 
 path = os.path.expanduser("~/.claude/settings.json")
 try:
@@ -802,26 +830,48 @@ except ValueError:
     sys.exit("existing settings.json is not valid JSON; refusing to touch it")
 
 env = data.setdefault("env", {})
+held = env.get("ANTHROPIC_AUTH_TOKEN")
 warn = ""
 if "CLAUDE_CODE_OAUTH_TOKEN" in env:
     warn = "WARNING: a stored CLAUDE_CODE_OAUTH_TOKEN is present in settings.json"
 
 if base_url:
+    if held and held != capability:
+        held_url = env.get("ANTHROPIC_BASE_URL")
+        if holder_is_live(held_url):
+            sys.exit("BUSY: another imp session is live on %s. Stop it first."
+                     % held_url)
+        warn = (warn + " | " if warn else "") + "took over a dead session's pointer"
     env["ANTHROPIC_BASE_URL"] = base_url
     env["ANTHROPIC_AUTH_TOKEN"] = capability
 else:
+    if held is not None and held != capability:
+        # Another session took over while we were running. Its pointer is
+        # live and ours is already gone; removing it would break them.
+        print("left another session's capability in place")
+        sys.exit(0)
     env.pop("ANTHROPIC_BASE_URL", None)
     env.pop("ANTHROPIC_AUTH_TOKEN", None)
     if not env:
         data.pop("env", None)
 
-os.makedirs(os.path.dirname(path), exist_ok=True)
-tmp = path + ".imp.tmp"
-with open(tmp, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
-os.chmod(tmp, 0o600)
-os.replace(tmp, path)
+d = os.path.dirname(path)
+os.makedirs(d, exist_ok=True)
+# A unique temp name: two writers sharing a fixed one interleave, and each
+# os.replace is atomic only with respect to its own content.
+fd, tmp = tempfile.mkstemp(prefix=".imp.", suffix=".tmp", dir=d)
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 print("ok" + ((" | " + warn) if warn else ""))
 '''
 
@@ -834,7 +884,11 @@ def remote_python(src, args=()):
 
 
 def write_sprite_settings(sprite, base_url, capability):
-    """Install (or clear) the sprite's pointer at us. Neither value is a secret."""
+    """Install (or clear) the sprite's pointer at us. Neither value is a secret.
+
+    Installing refuses to displace another session's capability while that
+    session is still listening; clearing only ever removes our own.
+    """
     argv = ssh_argv(sprite, remote_python(SETTINGS_SCRIPT))
     try:
         r = subprocess.run(argv, input="%s\n%s\n" % (base_url, capability),
@@ -930,6 +984,16 @@ def main():
         if ok:
             settings_written = True
             log("sprite settings.json points at the relay (%s)" % msg)
+        elif "BUSY:" in msg:
+            # Another live session owns the sprite. Breaking it is never the
+            # right default -- stop here rather than half-taking-over.
+            log(msg.replace("BUSY: ", ""))
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            proxy.shutdown()
+            return 1
         else:
             log("could not write sprite settings.json: %s" % msg)
             log("set these on the sprite yourself:")
@@ -953,7 +1017,7 @@ def main():
         except OSError:
             pass
         if settings_written:
-            ok, msg = write_sprite_settings(args.sprite, "", "")
+            ok, msg = write_sprite_settings(args.sprite, "", capability)
             log("cleared sprite settings.json" if ok
                 else "left an inert capability in settings.json (%s)" % msg)
         proxy.shutdown()

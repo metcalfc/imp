@@ -299,6 +299,23 @@ conceded risk; wedging your laptop is not.
 | concurrent streams | 256 | each `OPEN` costs a socket and a thread on your machine; a repeated stream id closes the socket it replaces rather than leaking it |
 | settings.json ssh | 30 s | the sprite decides when that command finishes and how much it prints — teardown must not be something it can hold open |
 
+## Concurrent sessions
+
+Two `imp` sessions against one sprite on the same remote port already refuse
+each other: the second relay cannot bind, so it exits before anything is
+written. Only `-p` lets them coexist, and then they contend over one
+`settings.json`.
+
+The capability is a unique per-session token, so it doubles as the owner tag:
+
+- **Installing** refuses if a *different* capability is present and something
+  is still listening on the port it names. That check runs on the sprite,
+  where the answer is a loopback connect.
+- **A pointer left by a killed session** has nothing listening behind it, so
+  it is taken over silently rather than blocking every future run.
+- **Teardown removes only your own.** Stripping `ANTHROPIC_*` unconditionally
+  was the half that actually broke the other session.
+
 Redirects are never followed. `urllib`'s default handler copies `Authorization`
 into a redirected request without checking the origin, so a `3xx` is passed
 back to the sprite verbatim rather than chased with your credential attached.

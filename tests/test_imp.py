@@ -850,6 +850,14 @@ class TestSettingsScript(unittest.TestCase):
             input="%s\n%s\n" % (base_url, capability),
             capture_output=True, text=True, env=env)
 
+    def listener(self):
+        """Stand in for another session's live relay; returns its port."""
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        self.addCleanup(srv.close)
+        return srv.getsockname()[1]
+
     def read(self):
         with open(self.path) as f:
             return f.read()
@@ -880,7 +888,7 @@ class TestSettingsScript(unittest.TestCase):
 
     def test_teardown_removes_the_env_block_entirely(self):
         self.run_script(self.home, "http://127.0.0.1:8080", "CAP")
-        r = self.run_script(self.home, "", "")
+        r = self.run_script(self.home, "", "CAP")
         self.assertEqual(r.returncode, 0, r.stderr)
         data = self.read_json()
         self.assertNotIn("env", data, "no env block should be left behind")
@@ -890,7 +898,7 @@ class TestSettingsScript(unittest.TestCase):
         with open(self.path, "w") as f:
             json.dump({"theme": "dark", "env": {"FOO": "bar"}}, f)
         self.run_script(self.home, "http://127.0.0.1:8080", "CAP")
-        self.run_script(self.home, "", "")
+        self.run_script(self.home, "", "CAP")
         data = self.read_json()
         self.assertEqual(data["theme"], "dark")
         self.assertEqual(data["env"], {"FOO": "bar"})
@@ -902,6 +910,62 @@ class TestSettingsScript(unittest.TestCase):
         r = self.run_script(self.home, "http://127.0.0.1:8080", "CAP")
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(self.read(), "{not json")
+
+    def test_refuses_to_displace_a_live_session(self):
+        live = self.listener()
+        self.run_script(self.home, "http://127.0.0.1:%d" % live, "CAP-A")
+        r = self.run_script(self.home, "http://127.0.0.1:9999", "CAP-B")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("BUSY", r.stderr)
+        # A's session is untouched.
+        env = self.read_json()["env"]
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "CAP-A")
+
+    def test_takes_over_a_dead_sessions_pointer(self):
+        """A killed imp leaves an inert pointer. Blocking every future run on
+        it would be worse than the problem it prevents."""
+        dead = free_port()          # nothing is listening there
+        self.run_script(self.home, "http://127.0.0.1:%d" % dead, "CAP-A")
+        r = self.run_script(self.home, "http://127.0.0.1:9999", "CAP-B")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("took over", r.stdout)
+        self.assertEqual(self.read_json()["env"]["ANTHROPIC_AUTH_TOKEN"], "CAP-B")
+
+    def test_unparseable_pointer_is_not_treated_as_live(self):
+        self.run_script(self.home, "http://127.0.0.1:8080", "CAP-A")
+        data = self.read_json()
+        data["env"]["ANTHROPIC_BASE_URL"] = "not-a-url"
+        with open(self.path, "w") as f:
+            json.dump(data, f)
+        r = self.run_script(self.home, "http://127.0.0.1:9999", "CAP-B")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_reinstalling_our_own_capability_is_not_busy(self):
+        self.run_script(self.home, "http://127.0.0.1:8080", "CAP-A")
+        r = self.run_script(self.home, "http://127.0.0.1:8080", "CAP-A")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_teardown_leaves_another_sessions_capability_alone(self):
+        """The half that actually damaged the other session: teardown used to
+        strip ANTHROPIC_* unconditionally."""
+        self.run_script(self.home, "http://127.0.0.1:8080", "CAP-A")
+        self.run_script(self.home, "http://127.0.0.1:8081", "CAP-B")
+        r = self.run_script(self.home, "", "CAP-A")     # A exits last
+        self.assertEqual(r.returncode, 0, r.stderr)
+        env = self.read_json()["env"]
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "CAP-B")
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8081")
+
+    def test_teardown_removes_our_own(self):
+        self.run_script(self.home, "http://127.0.0.1:8080", "CAP-A")
+        self.run_script(self.home, "", "CAP-A")
+        self.assertNotIn("env", self.read_json())
+
+    def test_no_fixed_temp_file_is_left_behind(self):
+        self.run_script(self.home, "http://127.0.0.1:8080", "CAP")
+        leftovers = [f for f in os.listdir(os.path.dirname(self.path))
+                     if f != "settings.json"]
+        self.assertEqual(leftovers, [], "temp file should be replaced away")
 
     def test_warns_about_a_stored_oauth_token(self):
         os.makedirs(os.path.dirname(self.path))
