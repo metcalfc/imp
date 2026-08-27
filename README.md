@@ -38,11 +38,15 @@ make install DIR=/usr/local/bin   # or anywhere else
 
 That installs `imp` and `imp-proxy`, which are the pair you run every day.
 `imp-auth` is a now-and-then tool — mint a token once, forget it exists — so
-it stays in the clone unless you want it on your `PATH` too:
+it stays in the clone unless you ask for it by name:
 
 ```sh
-install -m 755 imp-auth ~/.local/bin/
+make install-auth
 ```
+
+Never a dependency of `make install`. `imp-auth` mints a long-lived credential
+and can write one straight into a sprite's `settings.json` — reach for it on
+purpose, not because it arrived on your `PATH` alongside something else.
 
 | | |
 |---|---|
