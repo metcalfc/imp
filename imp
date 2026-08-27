@@ -6,6 +6,11 @@
 #     imp-proxy -s NAME          # lend the sprite your subscription
 #     sprite console -s NAME     # get a shell on it
 #
+# or, for any host you can ssh to:
+#
+#     imp-proxy -H box
+#     ssh -t box
+#
 # You would type the sprite name twice and juggle two terminals. This types it
 # once and puts them in one tmux window -- console on top, the proxy's log in
 # a strip along the bottom where you can see `ready`, `rejected:` and the rest
@@ -25,9 +30,10 @@ die() { printf 'imp: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat >&2 <<'USAGE'
-usage: imp [-s NAME] [imp-proxy options...]
+usage: imp [-s NAME | -H HOST] [imp-proxy options...]
 
-Opens a tmux window: `sprite console` above, `imp-proxy` below. Every option
+Opens a tmux window: a console above, `imp-proxy` below. -s gets you a sprite
+console, -H an ssh session to any host you own. Every option
 is passed through to imp-proxy untouched -- see `imp-proxy --help`.
 
 Ctrl-C in the lower pane revokes the sprite's access, exactly as it always
@@ -49,19 +55,36 @@ here=$(cd -- "$(dirname -- "$0")" && pwd)
 proxy="$here/imp-proxy"
 [ -x "$proxy" ] || proxy=imp-proxy
 
-# The name is wanted for one thing -- labelling the tmux window -- so a
-# failure to find it is not an error here. imp-proxy resolves it for real.
+# Two things are wanted from the arguments: which console to open, and a name
+# to label the tmux window with. imp-proxy does the real resolution and owns
+# every error about it, so a failure to work either out is not fatal here.
 sprite=""
+host=""
 prev=""
 for arg in "$@"; do
-  case "$prev" in -s|--sprite) sprite="$arg"; break ;; esac
+  case "$prev" in
+    -s|--sprite) sprite="$arg" ;;
+    -H|--host)   host="$arg" ;;
+  esac
   prev="$arg"
 done
-if [ -z "$sprite" ] && [ -r .sprite ]; then
-  read -r sprite < .sprite || sprite=""
+
+if [ -n "$host" ]; then
+  console="ssh -t $(printf '%q' "$host")"
+  name="$host"
+elif [ -n "$sprite" ]; then
+  console="sprite console -s $(printf '%q' "$sprite")"
+  name="$sprite"
+else
+  # No -s: plain `sprite console`, so the CLI resolves .sprite by its own
+  # rules rather than by ours. .sprite is read here for the window label and
+  # nothing else -- if the two ever disagree about which file counts, the
+  # label is the harmless place for that to show up.
+  console="sprite console"
+  [ -r .sprite ] && read -r sprite < .sprite
+  name="${sprite:-sprite}"
 fi
-[ -n "$sprite" ] || sprite="sprite"
-label=${sprite//[^A-Za-z0-9_-]/-}
+label=${name//[^A-Za-z0-9_-]/-}
 
 if ! command -v tmux >/dev/null 2>&1; then
   printf 'imp: no tmux -- running the proxy here.\n' >&2
@@ -77,12 +100,12 @@ for arg in "$@"; do
 done
 
 if [ -n "${TMUX:-}" ]; then
-  win=$(tmux new-window -P -F '#{window_id}' -n "imp:$label" "sprite console")
+  win=$(tmux new-window -P -F '#{window_id}' -n "imp:$label" "$console")
   attach=""
 else
   session="imp-$label"
   if ! win=$(tmux new-session -d -s "$session" -P -F '#{window_id}' \
-             -n "imp:$label" "sprite console" 2>/dev/null); then
+             -n "imp:$label" "$console" 2>/dev/null); then
     die "tmux session '$session' already exists -- try: tmux attach -t $session"
   fi
   attach="$session"

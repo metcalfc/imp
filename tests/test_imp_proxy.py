@@ -1180,21 +1180,65 @@ class TestRemotePython(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), "hello", r.stderr)
 
 
-class TestSshArgv(unittest.TestCase):
+class TestSpriteTarget(unittest.TestCase):
     def test_uses_sprite_proxy_as_the_transport(self):
-        argv = imp.ssh_argv("my-sprite", "true")
+        argv = imp.SpriteTarget("my-sprite").exec_argv("true")
         self.assertIn("ProxyCommand=sprite proxy --ssh -s my-sprite", argv)
 
     def test_omits_s_when_the_sprite_is_ambient(self):
-        argv = imp.ssh_argv("", "true")
+        argv = imp.SpriteTarget("").exec_argv("true")
         self.assertIn("ProxyCommand=sprite proxy --ssh", argv)
         self.assertNotIn("-s ", " ".join(argv).replace("-s my-sprite", ""))
 
     def test_does_not_reuse_a_control_socket(self):
         # A shared ControlMaster would outlive revocation.
-        argv = imp.ssh_argv("s", "true")
+        argv = imp.SpriteTarget("s").exec_argv("true")
         self.assertIn("ControlMaster=no", argv)
         self.assertIn("ControlPath=none", argv)
+
+    def test_the_link_ships_the_relay(self):
+        argv = imp.SpriteTarget("s").link_argv(8080, 61000)
+        self.assertNotIn("-R", argv)
+        self.assertIn("python3", argv[-1])
+
+
+class TestSSHTarget(unittest.TestCase):
+    """The claims that make -R as careful as the relay it replaces."""
+
+    def test_forward_binds_loopback_at_both_ends(self):
+        # `-R 8080:...` binds 0.0.0.0 wherever GatewayPorts is yes, which
+        # would put the capability endpoint on the network.
+        argv = imp.SSHTarget("box").link_argv(8080, 61000)
+        self.assertIn("127.0.0.1:8080:127.0.0.1:61000", argv)
+
+    def test_a_taken_remote_port_is_fatal_not_a_warning(self):
+        argv = imp.SSHTarget("box").link_argv(8080, 61000)
+        self.assertIn("ExitOnForwardFailure=yes", argv)
+
+    def test_host_key_checking_is_left_alone(self):
+        # Off is right for the sprite's throwaway transport and wrong for a
+        # machine you own.
+        argv = imp.SSHTarget("box").link_argv(8080, 61000)
+        blob = " ".join(argv)
+        self.assertNotIn("StrictHostKeyChecking", blob)
+        self.assertNotIn("UserKnownHostsFile", blob)
+
+    def test_does_not_reuse_a_control_socket(self):
+        argv = imp.SSHTarget("box").link_argv(8080, 61000)
+        self.assertIn("ControlMaster=no", argv)
+        self.assertIn("ControlPath=none", argv)
+
+    def test_the_remote_needs_no_python(self):
+        # The whole remote command, for the link: echo and cat.
+        argv = imp.SSHTarget("box").link_argv(8080, 61000)
+        self.assertNotIn("python", argv[-1])
+        self.assertIn(imp.LINK_MARKER, argv[-1])
+
+    def test_exec_argv_is_plain_ssh(self):
+        argv = imp.SSHTarget("user@box").exec_argv("true")
+        self.assertEqual(argv[0], "ssh")
+        self.assertEqual(argv[-2:], ["user@box", "true"])
+        self.assertNotIn("ProxyCommand", " ".join(argv))
 
 
 class TestHopHeaders(unittest.TestCase):

@@ -912,22 +912,114 @@ def wait_for_link(mux, proc, timeout):
     return False
 
 
-def ssh_argv(sprite, remote_cmd):
-    proxy_cmd = "sprite proxy --ssh"
-    if sprite:
-        proxy_cmd += " -s " + sprite
-    return [
-        "ssh",
-        "-o", "ProxyCommand=" + proxy_cmd,
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "LogLevel=ERROR",
-        "-o", "ControlMaster=no",
-        "-o", "ControlPath=none",
-        "-o", "ServerAliveInterval=10",
-        "-o", "ServerAliveCountMax=3",
-        "sprite", remote_cmd,
-    ]
+def wait_for_marker(proc, timeout):
+    """Same question for a native -R forward, same answer: wait to be told.
+
+    ssh returning success only means it connected. The marker is printed by
+    the remote shell, which does not run until the forward has been set up --
+    and with ExitOnForwardFailure, not at all if it could not be.
+    """
+    ready = threading.Event()
+
+    def reader():
+        for line in iter(proc.stdout.readline, b""):
+            if line.strip() == LINK_MARKER.encode():
+                ready.set()
+                return
+
+    threading.Thread(target=reader, daemon=True).start()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if ready.wait(0.25):
+            return True
+        if proc.poll() is not None:
+            return False
+    return False
+
+
+# A shared ControlMaster would outlive revocation -- the whole point is that
+# stopping this process ends the far side's access, and a multiplexed socket
+# someone else is holding open does not end.
+SSH_COMMON = [
+    "-o", "ControlMaster=no",
+    "-o", "ControlPath=none",
+    "-o", "ServerAliveInterval=10",
+    "-o", "ServerAliveCountMax=3",
+]
+
+# Printed by the far side once its end of the forward exists, which is the
+# only honest signal that it does. POSIX sh, no python: with a real -R there
+# is nothing else the remote has to be able to run.
+LINK_MARKER = "IMP_LINK_UP"
+LINK_CMD = "echo %s; exec cat >/dev/null" % LINK_MARKER
+
+
+class SpriteTarget(object):
+    """A Fly Sprite, reached through the sprite CLI.
+
+    `sprite proxy --ssh` supports neither -R nor -A, so the reverse forward
+    has to be the userspace relay in RELAY_SRC. Host key checking is off
+    because the ProxyCommand builds a fresh transport per connection -- there
+    is no stable key to pin, and the CLI has already authenticated it.
+    """
+
+    needs_relay = True
+
+    def __init__(self, name):
+        self.name = name
+
+    def label(self):
+        return self.name or "(from .sprite)"
+
+    def exec_argv(self, remote_cmd):
+        proxy_cmd = "sprite proxy --ssh"
+        if self.name:
+            proxy_cmd += " -s " + self.name
+        return [
+            "ssh",
+            "-o", "ProxyCommand=" + proxy_cmd,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "LogLevel=ERROR",
+        ] + SSH_COMMON + ["sprite", remote_cmd]
+
+    def link_argv(self, remote_port, local_port):
+        return self.exec_argv(remote_python(
+            RELAY_SRC, (str(remote_port), str(RELAY_IDLE_TIMEOUT))))
+
+
+class SSHTarget(object):
+    """Any host that speaks ordinary ssh, where -R does natively what the
+    relay was written to work around.
+
+    Host key checking is left alone here. The sprite's is a throwaway
+    transport; a machine you own is not, and turning off the check for it
+    would be trading a real protection for nothing.
+    """
+
+    needs_relay = False
+
+    def __init__(self, dest):
+        self.dest = dest
+
+    def label(self):
+        return self.dest
+
+    def exec_argv(self, remote_cmd):
+        return ["ssh"] + SSH_COMMON + [self.dest, remote_cmd]
+
+    def link_argv(self, remote_port, local_port):
+        # 127.0.0.1 spelled out on both ends. `-R 8080:...` binds 0.0.0.0 on
+        # a host configured with GatewayPorts yes, which would put the
+        # capability endpoint on the network -- the one way this transport
+        # can be less careful than the relay, which only ever binds loopback.
+        fwd = "127.0.0.1:%d:127.0.0.1:%d" % (remote_port, local_port)
+        # Without ExitOnForwardFailure a taken remote port is a warning and a
+        # session that silently has no proxy behind it. The relay reports the
+        # same condition by failing to bind and never pinging.
+        return ["ssh", "-R", fwd,
+                "-o", "ExitOnForwardFailure=yes"] + SSH_COMMON + [
+                self.dest, LINK_CMD]
 
 
 # Compare-and-swap on the capability, which is already unique per session.
@@ -1027,20 +1119,21 @@ def remote_python(src, args=()):
             % (b64, argv))
 
 
-def write_sprite_settings(sprite, base_url, capability):
-    """Install (or clear) the sprite's pointer at us. Neither value is a secret.
+def write_remote_settings(target, base_url, capability):
+    """Install (or clear) the far side's pointer at us. Neither value is a
+    secret.
 
     Installing refuses to displace another session's capability while that
     session is still listening; clearing only ever removes our own.
     """
-    argv = ssh_argv(sprite, remote_python(SETTINGS_SCRIPT))
+    argv = target.exec_argv(remote_python(SETTINGS_SCRIPT))
     try:
         r = subprocess.run(argv, input="%s\n%s\n" % (base_url, capability),
                            capture_output=True, text=True,
                            timeout=SETTINGS_TIMEOUT)
     except subprocess.TimeoutExpired:
-        # The sprite controls when this command finishes and how much it
-        # prints. Teardown must not be something it can hold open.
+        # The far side controls when this command finishes and how much
+        # it prints. Teardown must not be something it can hold open.
         return False, "timed out after %.0fs" % SETTINGS_TIMEOUT
     if r.returncode != 0:
         return False, (r.stderr.strip() or "ssh failed")
@@ -1051,20 +1144,23 @@ def write_sprite_settings(sprite, base_url, capability):
 
 def main():
     ap = argparse.ArgumentParser(
-        prog="imp",
-        description="Lend a sprite your Claude Max subscription without giving "
-                    "it the credential.",
+        prog="imp-proxy",
+        description="Lend a sprite -- or any host you can ssh to -- your Claude "
+                    "Max subscription without giving it the credential.",
         epilog="The credential never leaves this machine. Stop the proxy "
-               "(Ctrl-C) and the sprite's access dies immediately -- running "
+               "(Ctrl-C) and the far side's access dies immediately -- running "
                "`claude` processes there simply start failing API calls, so "
                "revoking costs you nothing but a reconnect.")
     ap.add_argument("-s", "--sprite", default="",
                     help="sprite name (default: the one `sprite use` selected "
                          "in this directory)")
+    ap.add_argument("-H", "--host", default="",
+                    help="an ssh destination instead of a sprite -- anything "
+                         "`ssh` accepts, including a Host from your ssh config")
     ap.add_argument("-p", "--remote-port", type=int, default=8080,
-                    help="port the relay listens on inside the sprite (default 8080)")
+                    help="port to listen on at the far end (default 8080)")
     ap.add_argument("--no-settings", action="store_true",
-                    help="do not touch the sprite's ~/.claude/settings.json; "
+                    help="do not touch the far side's ~/.claude/settings.json; "
                          "print the env vars for you to set yourself")
     ap.add_argument("--allow", action="append", default=[], metavar="GLOB",
                     help="allow an extra request path through; repeatable, "
@@ -1076,7 +1172,12 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="log each proxied request")
     args = ap.parse_args()
-    args.sprite = resolve_sprite(args.sprite)
+    if args.host and args.sprite:
+        die("-s and -H name two different machines; pick one.")
+    if args.host:
+        target = SSHTarget(args.host)
+    else:
+        target = SpriteTarget(resolve_sprite(args.sprite))
 
     cred = Credential()
     capability = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
@@ -1094,8 +1195,7 @@ def main():
     threading.Thread(target=proxy.serve_forever, daemon=True).start()
     log("injecting proxy on 127.0.0.1:%d (loopback only)" % proxy_port)
 
-    remote = remote_python(RELAY_SRC, (str(args.remote_port), str(RELAY_IDLE_TIMEOUT)))
-    proc = subprocess.Popen(ssh_argv(args.sprite, remote),
+    proc = subprocess.Popen(target.link_argv(args.remote_port, proxy_port),
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=None, bufsize=0)
 
@@ -1113,12 +1213,23 @@ def main():
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, on_signal)
 
-    mux = Mux(proc, proxy_port, args.verbose)
-    threading.Thread(target=mux.run, daemon=True).start()
-    if not wait_for_link(mux, proc, LINK_TIMEOUT):
-        log("no relay came up on sprite '%s' -- link failed or timed out."
-            % (args.sprite or "(from .sprite)"))
-        log("check `sprite ls` and that python3 exists on the sprite.")
+    # The sprite gets the userspace relay and its demultiplexer; a plain ssh
+    # host gets -R, where the kernel on both ends is the demultiplexer and
+    # there is nothing here to run.
+    mux = None
+    if target.needs_relay:
+        mux = Mux(proc, proxy_port, args.verbose)
+        threading.Thread(target=mux.run, daemon=True).start()
+        linked = wait_for_link(mux, proc, LINK_TIMEOUT)
+    else:
+        linked = wait_for_marker(proc, LINK_TIMEOUT)
+    if not linked:
+        log("no link to '%s' -- it failed or timed out." % target.label())
+        if target.needs_relay:
+            log("check `sprite ls` and that python3 exists on the sprite.")
+        else:
+            log("check `ssh %s true`, and that port %d is free there."
+                % (target.label(), args.remote_port))
         try:
             proc.terminate()
         except OSError:
@@ -1129,12 +1240,12 @@ def main():
     base_url = "http://127.0.0.1:%d" % args.remote_port
     settings_written = False
     if not args.no_settings:
-        ok, msg = write_sprite_settings(args.sprite, base_url, capability)
+        ok, msg = write_remote_settings(target, base_url, capability)
         if ok:
             settings_written = True
-            log("sprite settings.json points at the relay (%s)" % msg)
+            log("remote settings.json points at us (%s)" % msg)
         elif "BUSY:" in msg:
-            # Another live session owns the sprite. Breaking it is never the
+            # Another live session owns the far side. Breaking it is never the
             # right default -- stop here rather than half-taking-over.
             log(msg.replace("BUSY: ", ""))
             try:
@@ -1144,30 +1255,31 @@ def main():
             proxy.shutdown()
             return 1
         else:
-            log("could not write sprite settings.json: %s" % msg)
-            log("set these on the sprite yourself:")
+            log("could not write remote settings.json: %s" % msg)
+            log("set these on the far side yourself:")
             log("  ANTHROPIC_BASE_URL=%s" % base_url)
             log("  ANTHROPIC_AUTH_TOKEN=%s" % capability)
     else:
-        log("set these on the sprite yourself:")
+        log("set these on the far side yourself:")
         log("  ANTHROPIC_BASE_URL=%s" % base_url)
         log("  ANTHROPIC_AUTH_TOKEN=%s" % capability)
 
-    log("ready -- `claude` on the sprite now runs on your Max subscription.")
-    log("Ctrl-C revokes instantly. Nothing to clean up on the sprite.")
+    log("ready -- `claude` on %s now runs on your Max subscription."
+        % target.label())
+    log("Ctrl-C revokes instantly. Nothing to clean up there.")
 
     try:
-        while mux.alive and proc.poll() is None:
+        while proc.poll() is None and (mux is None or mux.alive):
             time.sleep(0.25)
     finally:
-        log("link closed -- sprite access revoked")
+        log("link closed -- access revoked")
         try:
             proc.terminate()
         except OSError:
             pass
         if settings_written:
-            ok, msg = write_sprite_settings(args.sprite, "", capability)
-            log("cleared sprite settings.json" if ok
+            ok, msg = write_remote_settings(target, "", capability)
+            log("cleared remote settings.json" if ok
                 else "left an inert capability in settings.json (%s)" % msg)
         proxy.shutdown()
     return 0
