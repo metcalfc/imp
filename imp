@@ -289,6 +289,22 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 OPENER = urllib.request.build_opener(_NoRedirect)
 
 
+def _drop(conn):
+    """Close a proxied socket that another thread may be blocked reading.
+
+    Same reason as the relay's drop(): close() alone does not reliably wake a
+    thread parked in recv(), nor guarantee the peer sees EOF.
+    """
+    try:
+        conn.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        conn.close()
+    except OSError:
+        pass
+
+
 def _close(resp):
     """Release an upstream response -- an HTTPError body holds a socket too."""
     try:
@@ -485,6 +501,20 @@ slock = threading.Lock()
 last = [time.time()]
 
 
+def drop(conn):
+    # shutdown() before close(): another thread is blocked in recv() on this
+    # socket, and close() alone neither reliably wakes it nor guarantees the
+    # peer sees EOF. shutdown() does both.
+    try:
+        conn.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        conn.close()
+    except OSError:
+        pass
+
+
 def send(sid, t, payload=b""):
     with outlock:
         try:
@@ -509,10 +539,7 @@ def pump(sid, conn):
         with slock:
             streams.pop(sid, None)
         send(sid, T_CLOSE)
-        try:
-            conn.close()
-        except OSError:
-            pass
+        drop(conn)
 
 
 def acceptor():
@@ -585,17 +612,11 @@ while True:
         except OSError:
             with slock:
                 streams.pop(sid, None)
-            try:
-                conn.close()
-            except OSError:
-                pass
+            drop(conn)
     elif t == T_CLOSE:
         with slock:
             streams.pop(sid, None)
-        try:
-            conn.close()
-        except OSError:
-            pass
+        drop(conn)
 os._exit(0)
 '''
 
@@ -640,10 +661,7 @@ class Mux(object):
             with self.lock:
                 self.socks.pop(sid, None)
             self.send(sid, T_CLOSE)
-            try:
-                conn.close()
-            except OSError:
-                pass
+            _drop(conn)
 
     def _open(self, sid):
         with self.lock:
@@ -654,10 +672,7 @@ class Mux(object):
             stale = self.socks.pop(sid, None)
         if stale is not None:
             # A repeated SID used to overwrite the entry and leak the socket.
-            try:
-                stale.close()
-            except OSError:
-                pass
+            _drop(stale)
         try:
             conn = socket.create_connection(("127.0.0.1", self.proxy_port), timeout=10)
             conn.settimeout(None)
@@ -719,10 +734,7 @@ class Mux(object):
                 with self.lock:
                     conn = self.socks.pop(sid, None)
                 if conn is not None:
-                    try:
-                        conn.close()
-                    except OSError:
-                        pass
+                    _drop(conn)
         self.alive = False
         self.ready.set()
 
