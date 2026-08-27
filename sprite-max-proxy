@@ -66,12 +66,19 @@ HDR = struct.Struct("!IBI")
 T_OPEN, T_DATA, T_CLOSE, T_PING = 1, 2, 3, 4
 
 PING_EVERY = 10.0
+LINK_TIMEOUT = 60.0
 RELAY_IDLE_TIMEOUT = 30.0
 
 
 def log(*a):
     sys.stderr.write("[sprite-max-proxy] " + " ".join(str(x) for x in a) + "\n")
     sys.stderr.flush()
+
+
+def die(*lines):
+    for line in lines:
+        log(line)
+    raise SystemExit(2)
 
 
 # --------------------------------------------------------------------------
@@ -371,10 +378,18 @@ def pump(sid, conn):
 def acceptor():
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", PORT))
+    try:
+        srv.bind(("127.0.0.1", PORT))
+    except OSError as e:
+        sys.stderr.write("relay: cannot bind 127.0.0.1:%d: %s\n" % (PORT, e))
+        sys.stderr.flush()
+        os._exit(1)
     srv.listen(64)
     sys.stderr.write("relay listening on 127.0.0.1:%d\n" % PORT)
     sys.stderr.flush()
+    # Tell the other end the link is genuinely up. Nothing is "ready" before
+    # this frame arrives.
+    send(0, T_PING)
     n = 0
     while True:
         conn, _ = srv.accept()
@@ -460,6 +475,7 @@ class Mux(object):
         self.lock = threading.Lock()
         self.wlock = threading.Lock()
         self.alive = True
+        self.ready = threading.Event()
 
     def send(self, sid, t, payload=b""):
         with self.wlock:
@@ -525,6 +541,7 @@ class Mux(object):
             payload = self._readexact(ln) if ln else b""
             if payload is None:
                 break
+            self.ready.set()
             if t == T_OPEN:
                 self._open(sid)
             elif t == T_DATA:
@@ -545,11 +562,37 @@ class Mux(object):
                     except OSError:
                         pass
         self.alive = False
+        self.ready.set()
 
 
 # --------------------------------------------------------------------------
 # sprite plumbing
 # --------------------------------------------------------------------------
+
+def resolve_sprite(name):
+    """`sprite` takes its target from -s or from a .sprite file in the current
+    directory -- there is no other default. Establish that here rather than
+    discovering it as an ssh failure after the credential is already loaded."""
+    if name:
+        return name
+    if os.path.exists(".sprite"):
+        return ""  # the sprite CLI reads it, exactly as it would anyway
+    die("no sprite selected.",
+        "  sprite-max-proxy -s NAME",
+        "or run `sprite use NAME` in this directory first.")
+
+
+def wait_for_link(mux, proc, timeout):
+    """The relay pings as soon as it is listening; that frame is the only
+    honest signal that the sprite side exists."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if mux.ready.wait(0.25):
+            return mux.alive
+        if proc.poll() is not None:
+            return False
+    return False
+
 
 def ssh_argv(sprite, remote_cmd):
     proxy_cmd = "sprite proxy --ssh"
@@ -638,7 +681,8 @@ def main():
                "`claude` processes there simply start failing API calls, so "
                "revoking costs you nothing but a reconnect.")
     ap.add_argument("-s", "--sprite", default="",
-                    help="sprite name (default: whichever `sprite use` selected here)")
+                    help="sprite name (default: the one `sprite use` selected "
+                         "in this directory)")
     ap.add_argument("-p", "--remote-port", type=int, default=8080,
                     help="port the relay listens on inside the sprite (default 8080)")
     ap.add_argument("--no-settings", action="store_true",
@@ -654,6 +698,7 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="log each proxied request")
     args = ap.parse_args()
+    args.sprite = resolve_sprite(args.sprite)
 
     cred = Credential()
     capability = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
@@ -676,6 +721,28 @@ def main():
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=None, bufsize=0)
 
+    def on_signal(signum, frame):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    mux = Mux(proc, proxy_port, args.verbose)
+    threading.Thread(target=mux.run, daemon=True).start()
+    if not wait_for_link(mux, proc, LINK_TIMEOUT):
+        log("no relay came up on sprite '%s' -- link failed or timed out."
+            % (args.sprite or "(from .sprite)"))
+        log("check `sprite ls` and that python3 exists on the sprite.")
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        proxy.shutdown()
+        return 1
+
     base_url = "http://127.0.0.1:%d" % args.remote_port
     settings_written = False
     if not args.no_settings:
@@ -696,21 +763,9 @@ def main():
     log("ready -- `claude` on the sprite now runs on your Max subscription.")
     log("Ctrl-C revokes instantly. Nothing to clean up on the sprite.")
 
-    mux = Mux(proc, proxy_port, args.verbose)
-    stop = threading.Event()
-
-    def on_signal(signum, frame):
-        stop.set()
-        try:
-            proc.terminate()
-        except OSError:
-            pass
-
-    signal.signal(signal.SIGINT, on_signal)
-    signal.signal(signal.SIGTERM, on_signal)
-
     try:
-        mux.run()
+        while mux.alive and proc.poll() is None:
+            time.sleep(0.25)
     finally:
         log("link closed -- sprite access revoked")
         try:
@@ -722,7 +777,8 @@ def main():
             log("cleared sprite settings.json" if ok
                 else "left an inert capability in settings.json (%s)" % msg)
         proxy.shutdown()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

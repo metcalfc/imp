@@ -275,7 +275,8 @@ argv and writes nothing to the sprite's disk.
 sprite-max-proxy [-s SPRITE] [-p REMOTE_PORT] [--no-settings]
                  [--allow GLOB] [--allow-any-path] [-v]
 
-  -s, --sprite        sprite name (default: whatever `sprite use` selected here)
+  -s, --sprite        sprite name (default: the one `sprite use` selected in
+                      this directory; without either, it exits and says so)
   -p, --remote-port   port the relay listens on inside the sprite (default 8080)
       --no-settings   don't touch the sprite's settings.json; print the env
                       vars and set them yourself
