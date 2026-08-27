@@ -62,7 +62,7 @@ label=${sprite//[^A-Za-z0-9_-]/-}
 
 if ! command -v tmux >/dev/null 2>&1; then
   printf 'imp: no tmux -- running the proxy here.\n' >&2
-  printf 'imp: open a console with `sprite console` in another terminal.\n' >&2
+  printf 'imp: open a console elsewhere with: sprite console\n' >&2
   exec "$proxy" "$@"
 fi
 
@@ -80,7 +80,7 @@ else
   session="imp-$label"
   if ! win=$(tmux new-session -d -s "$session" -P -F '#{window_id}' \
              -n "imp:$label" "sprite console" 2>/dev/null); then
-    die "tmux session '$session' already exists -- \`tmux attach -t $session\`"
+    die "tmux session '$session' already exists -- try: tmux attach -t $session"
   fi
   attach="$session"
 fi
