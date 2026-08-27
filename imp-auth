@@ -227,7 +227,7 @@ for_each() {
 
 main() {
   local cmd="${1:-}"
-  [ $# -gt 0 ] && shift || true
+  if [ $# -gt 0 ]; then shift; fi
   case "$cmd" in
     mint)   cmd_mint ;;
     store)  cmd_store ;;

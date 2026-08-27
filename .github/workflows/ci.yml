@@ -24,8 +24,20 @@ jobs:
       - name: bash -n
         run: bash -n imp-auth
 
+      # Pinned, with a checksum. The runner image's shellcheck drifts, and a
+      # version that disagrees with the one on the author's machine turns CI
+      # red for findings that are clean locally.
       - name: shellcheck
-        run: shellcheck imp-auth
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          url="https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -sSfL -o shellcheck.tar.xz "$url"
+          echo "${SHELLCHECK_SHA256}  shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf shellcheck.tar.xz
+          "shellcheck-${SHELLCHECK_VERSION}/shellcheck" --version
+          "shellcheck-${SHELLCHECK_VERSION}/shellcheck" imp-auth
 
       - name: py_compile
         run: python3 -m py_compile imp
