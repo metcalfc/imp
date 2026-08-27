@@ -31,7 +31,10 @@ Opens a tmux window: `sprite console` above, `imp-proxy` below. Every option
 is passed through to imp-proxy untouched -- see `imp-proxy --help`.
 
 Ctrl-C in the lower pane revokes the sprite's access, exactly as it always
-has. So does closing the window.
+has, and takes the pane with it -- leaving you the console, now unfunded.
+Closing the window revokes too.
+
+To lend it again without a fresh window: split and run imp-proxy yourself.
 USAGE
 }
 
@@ -89,8 +92,15 @@ fi
 # into. Eight lines is its whole startup banner with nothing scrolled off.
 pane=$(tmux split-window -v -l 8 -d -t "$win" -P -F '#{pane_id}' "$cmd")
 
-# So a proxy that dies leaves its reason on screen instead of the pane
-# vanishing. Pane options are tmux 3.0+; on older tmux this is merely absent.
-tmux set-option -p -t "$pane" remain-on-exit on 2>/dev/null || true
+# `failed`, not `on`. Ctrl-C is imp-proxy's clean exit -- it tears down and
+# returns 0 -- so the pane closes with it and you are left with the console,
+# which is the whole shape of revoking. A proxy that dies for a reason exits
+# non-zero and its pane stays put with the reason still on screen.
+#
+# Pane options need tmux 3.0 and the `failed` value 3.2; older tmux falls back
+# to keeping every dead pane, and older still does without.
+tmux set-option -p -t "$pane" remain-on-exit failed 2>/dev/null \
+  || tmux set-option -p -t "$pane" remain-on-exit on 2>/dev/null \
+  || true
 
 [ -z "$attach" ] || exec tmux attach -t "$attach"

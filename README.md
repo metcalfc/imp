@@ -11,8 +11,9 @@ imp -s my-sprite
 
 A tmux window: a console on the sprite above, the proxy's log in a strip
 below. `claude` there now runs on your Max subscription. Ctrl-C the lower pane
-— or close the window — and access dies instantly. The sprite never held
-anything worth stealing.
+and access dies instantly — the pane goes with it, leaving the console you
+were working in, now unfunded. Closing the window revokes too. The sprite
+never held anything worth stealing.
 
 `imp` is only sugar for two commands you could type yourself. The one that
 matters is `imp-proxy`, which needs no tmux and is a Ctrl-C away as it always
@@ -218,6 +219,7 @@ Verified against a live sprite:
 | Ctrl-C, then `claude` on the sprite | `Not logged in · Please run /login` |
 | clean exit teardown | `NO ENV BLOCK` — settings.json restored |
 | closing the terminal or the tmux pane (SIGHUP) | same as a clean exit — settings.json restored |
+| Ctrl-C in the proxy pane | teardown runs, exit 0, and the pane closes itself — a pane that stays is one that failed |
 | `kill -9`, no teardown, 30s later | relay gone, port freed, only an inert capability left |
 
 ## Blast radius
