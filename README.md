@@ -27,13 +27,21 @@ worth taking, and it goes away when you stop looking at it.*
 
 ## Install
 
-Three files, no packaging, no dependencies. Drop them somewhere on your
-`PATH`:
+Three files, no packaging, no dependencies:
 
 ```sh
 git clone https://github.com/metcalfc/imp.git
 cd imp
-install -m 755 imp imp-proxy imp-auth /usr/local/bin/
+make install                      # ~/.local/bin
+make install DIR=/usr/local/bin   # or anywhere else
+```
+
+That installs `imp` and `imp-proxy`, which are the pair you run every day.
+`imp-auth` is a now-and-then tool — mint a token once, forget it exists — so
+it stays in the clone unless you want it on your `PATH` too:
+
+```sh
+install -m 755 imp-auth ~/.local/bin/
 ```
 
 | | |
@@ -54,7 +62,7 @@ Then either log in with `claude` and go, or mint a dedicated token first —
 recommended, and explained under [Credential selection](#credential-selection):
 
 ```sh
-imp-auth mint          # `claude setup-token`, stored in your keychain
+./imp-auth mint        # `claude setup-token`, stored in your keychain
 imp -s my-sprite
 ```
 
