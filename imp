@@ -86,6 +86,12 @@ else
 fi
 label=${name//[^A-Za-z0-9_-]/-}
 
+# --clear is not a session, so it gets no window -- it clears and exits.
+for arg in "$@"; do
+  [ "$arg" = --clear ] || continue
+  exec "$proxy" "$@"
+done
+
 if ! command -v tmux >/dev/null 2>&1; then
   printf 'imp: no tmux -- running the proxy here.\n' >&2
   printf 'imp: open a console elsewhere with: sprite console\n' >&2

@@ -1038,6 +1038,9 @@ import json, os, socket, sys, tempfile
 
 base_url = sys.stdin.readline().strip()
 capability = sys.stdin.readline().strip()
+# Clearing normally removes only our own pointer. --clear passes force, which
+# is the escape hatch for one nothing is behind.
+force = sys.stdin.readline().strip() == "force"
 
 
 def holder_is_live(url):
@@ -1081,11 +1084,21 @@ if base_url:
     env["ANTHROPIC_BASE_URL"] = base_url
     env["ANTHROPIC_AUTH_TOKEN"] = capability
 else:
-    if held is not None and held != capability:
+    if held is None:
+        warn = (warn + " | " if warn else "") + "no pointer was set"
+    elif held != capability and not force:
         # Another session took over while we were running. Its pointer is
         # live and ours is already gone; removing it would break them.
         print("left another session's capability in place")
         sys.exit(0)
+    elif held != capability:
+        # Say what was taken and whether anything is behind it, because the
+        # answer decides whether there is a session somewhere to go and stop.
+        note = ("something is STILL listening on it"
+                if holder_is_live(env.get("ANTHROPIC_BASE_URL"))
+                else "nothing was listening on it")
+        warn = (warn + " | " if warn else "") + (
+            "cleared a pointer we did not own (%s...); %s" % (held[:8], note))
     env.pop("ANTHROPIC_BASE_URL", None)
     env.pop("ANTHROPIC_AUTH_TOKEN", None)
     if not env:
@@ -1119,7 +1132,7 @@ def remote_python(src, args=()):
             % (b64, argv))
 
 
-def write_remote_settings(target, base_url, capability):
+def write_remote_settings(target, base_url, capability, force=False):
     """Install (or clear) the far side's pointer at us. Neither value is a
     secret.
 
@@ -1128,7 +1141,9 @@ def write_remote_settings(target, base_url, capability):
     """
     argv = target.exec_argv(remote_python(SETTINGS_SCRIPT))
     try:
-        r = subprocess.run(argv, input="%s\n%s\n" % (base_url, capability),
+        r = subprocess.run(argv,
+                           input="%s\n%s\n%s\n" % (base_url, capability,
+                                                    "force" if force else ""),
                            capture_output=True, text=True,
                            timeout=SETTINGS_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -1138,6 +1153,27 @@ def write_remote_settings(target, base_url, capability):
     if r.returncode != 0:
         return False, (r.stderr.strip() or "ssh failed")
     return True, r.stdout.strip()
+
+
+def clear_target(target):
+    """Force-remove the far side's pointer, whoever wrote it.
+
+    There is nothing running on the far side to kill -- an imp session is a
+    process on somebody's machine plus a line in a settings.json -- so this
+    removes the line and reports whether anything is still answering behind
+    it. Something listening means a session really is live, on a machine that
+    is not necessarily this one; nothing listening means the pointer was the
+    whole of it.
+    """
+    ok, msg = write_remote_settings(target, "", "", force=True)
+    if not ok:
+        log("could not clear %s: %s" % (target.label(), msg))
+        return 1
+    # The script reports through the same "ok | note" line every other call
+    # uses; for a clear, the note is the whole of the news.
+    log("%s: %s" % (target.label(),
+                    msg[5:] if msg.startswith("ok | ") else "cleared"))
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -1169,6 +1205,11 @@ def main():
                     help="disable the path allowlist entirely -- the proxy "
                          "becomes an open relay to your account for the "
                          "length of the session")
+    ap.add_argument("--clear", action="store_true",
+                    help="remove the far side's ANTHROPIC_* pointer, whoever "
+                         "left it, and say whether anything is still behind "
+                         "it. The way out of a pointer with nothing running "
+                         "under it; starts no proxy and reads no credential")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="log each proxied request")
     args = ap.parse_args()
@@ -1178,6 +1219,9 @@ def main():
         target = SSHTarget(args.host)
     else:
         target = SpriteTarget(resolve_sprite(args.sprite))
+
+    if args.clear:
+        return clear_target(target)
 
     cred = Credential()
     capability = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
@@ -1194,6 +1238,36 @@ def main():
     proxy_port = proxy.server_address[1]
     threading.Thread(target=proxy.serve_forever, daemon=True).start()
     log("injecting proxy on 127.0.0.1:%d (loopback only)" % proxy_port)
+
+    base_url = "http://127.0.0.1:%d" % args.remote_port
+
+    # Ownership is settled before the link exists, and the ordering is the
+    # whole of the check. Once our own forward is listening on the far side's
+    # port, holder_is_live() connects to it and reports *us* as the incumbent
+    # -- so a pointer left behind by a killed session would refuse every
+    # future run, permanently, with nothing there to go and stop.
+    settings_written = False
+    if not args.no_settings:
+        ok, msg = write_remote_settings(target, base_url, capability)
+        if ok:
+            settings_written = True
+            log("remote settings.json points at us (%s)" % msg)
+        elif "BUSY:" in msg:
+            # Another live session owns the far side. Breaking it is never the
+            # right default -- stop here rather than half-taking-over.
+            log(msg.replace("BUSY: ", ""))
+            log("if nothing is really running there: imp-proxy --clear")
+            proxy.shutdown()
+            return 1
+        else:
+            log("could not write remote settings.json: %s" % msg)
+            log("set these on the far side yourself:")
+            log("  ANTHROPIC_BASE_URL=%s" % base_url)
+            log("  ANTHROPIC_AUTH_TOKEN=%s" % capability)
+    else:
+        log("set these on the far side yourself:")
+        log("  ANTHROPIC_BASE_URL=%s" % base_url)
+        log("  ANTHROPIC_AUTH_TOKEN=%s" % capability)
 
     proc = subprocess.Popen(target.link_argv(args.remote_port, proxy_port),
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1234,35 +1308,12 @@ def main():
             proc.terminate()
         except OSError:
             pass
+        # The pointer went in before the link was tried, so a link that never
+        # came up leaves one to take back out.
+        if settings_written:
+            write_remote_settings(target, "", capability)
         proxy.shutdown()
         return 1
-
-    base_url = "http://127.0.0.1:%d" % args.remote_port
-    settings_written = False
-    if not args.no_settings:
-        ok, msg = write_remote_settings(target, base_url, capability)
-        if ok:
-            settings_written = True
-            log("remote settings.json points at us (%s)" % msg)
-        elif "BUSY:" in msg:
-            # Another live session owns the far side. Breaking it is never the
-            # right default -- stop here rather than half-taking-over.
-            log(msg.replace("BUSY: ", ""))
-            try:
-                proc.terminate()
-            except OSError:
-                pass
-            proxy.shutdown()
-            return 1
-        else:
-            log("could not write remote settings.json: %s" % msg)
-            log("set these on the far side yourself:")
-            log("  ANTHROPIC_BASE_URL=%s" % base_url)
-            log("  ANTHROPIC_AUTH_TOKEN=%s" % capability)
-    else:
-        log("set these on the far side yourself:")
-        log("  ANTHROPIC_BASE_URL=%s" % base_url)
-        log("  ANTHROPIC_AUTH_TOKEN=%s" % capability)
 
     log("ready -- `claude` on %s now runs on your Max subscription."
         % target.label())

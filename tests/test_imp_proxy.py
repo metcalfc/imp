@@ -1028,11 +1028,12 @@ class TestRelayWatchdog(unittest.TestCase):
 class TestSettingsScript(unittest.TestCase):
     """SETTINGS_SCRIPT runs on the sprite; drive it the way imp does."""
 
-    def run_script(self, home, base_url, capability):
+    def run_script(self, home, base_url, capability, force=False):
         env = dict(os.environ, HOME=home)
         return subprocess.run(
             [sys.executable, "-u", "-c", imp.SETTINGS_SCRIPT],
-            input="%s\n%s\n" % (base_url, capability),
+            input="%s\n%s\n%s\n" % (base_url, capability,
+                                      "force" if force else ""),
             capture_output=True, text=True, env=env)
 
     def listener(self):
@@ -1129,6 +1130,47 @@ class TestSettingsScript(unittest.TestCase):
         self.run_script(self.home, "http://127.0.0.1:8080", "CAP-A")
         r = self.run_script(self.home, "http://127.0.0.1:8080", "CAP-A")
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_force_clears_a_pointer_we_do_not_own(self):
+        """--clear: the way out of a pointer nothing is behind."""
+        dead = free_port()
+        self.run_script(self.home, "http://127.0.0.1:%d" % dead, "CAP-A")
+        r = self.run_script(self.home, "", "", force=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("cleared a pointer we did not own", r.stdout)
+        self.assertIn("nothing was listening", r.stdout)
+        self.assertNotIn("env", self.read_json())
+
+    def test_force_clear_says_when_something_is_still_listening(self):
+        """A live holder means there is a session somewhere to go and stop --
+        which the pointer alone cannot tell you."""
+        live = self.listener()
+        self.run_script(self.home, "http://127.0.0.1:%d" % live, "CAP-A")
+        r = self.run_script(self.home, "", "", force=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("STILL listening", r.stdout)
+
+    def test_force_clear_keeps_unrelated_settings(self):
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, "w") as f:
+            json.dump({"theme": "dark", "env": {"FOO": "bar"}}, f)
+        self.run_script(self.home, "http://127.0.0.1:8080", "CAP-A")
+        self.run_script(self.home, "", "", force=True)
+        data = self.read_json()
+        self.assertEqual(data["theme"], "dark")
+        self.assertEqual(data["env"], {"FOO": "bar"})
+
+    def test_clearing_without_force_still_spares_another_session(self):
+        self.run_script(self.home, "http://127.0.0.1:8080", "CAP-A")
+        r = self.run_script(self.home, "", "CAP-B")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("left another session's capability in place", r.stdout)
+        self.assertEqual(self.read_json()["env"]["ANTHROPIC_AUTH_TOKEN"], "CAP-A")
+
+    def test_force_clear_on_a_clean_far_side_is_not_an_error(self):
+        r = self.run_script(self.home, "", "", force=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("no pointer was set", r.stdout)
 
     def test_teardown_leaves_another_sessions_capability_alone(self):
         """The half that actually damaged the other session: teardown used to

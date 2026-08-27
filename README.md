@@ -396,6 +396,30 @@ conceded risk; wedging your laptop is not.
 | concurrent streams | 256 | each `OPEN` costs a socket and a thread on your machine; a repeated stream id closes the socket it replaces rather than leaking it |
 | settings.json ssh | 30 s | the sprite decides when that command finishes and how much it prints — teardown must not be something it can hold open |
 
+## When a far side says it is busy
+
+There is nothing running on the far side to kill. An imp session is a process
+on somebody's machine plus two lines in a `settings.json`, so "stop the other
+session" means finding that process, on that machine — and if the session is
+already gone, there is nothing to find.
+
+```
+imp-proxy --clear -H my-box
+```
+
+removes the pointer whoever left it, and says which case you were in:
+
+```
+my-box: cleared a pointer we did not own (GHOST-ab...); nothing was listening on it
+my-box: cleared a pointer we did not own (PDlgO_cV...); something is STILL listening on it
+```
+
+The second line means a session really is live somewhere and you have just
+taken the far side away from it — it will keep working until its own proxy
+notices, then start failing API calls. There is no registry of far sides, so
+`--clear` clears the one you name; "all of them" is a shell loop over the
+names you know.
+
 ## Concurrent sessions
 
 Two `imp-proxy` sessions against one sprite on the same remote port already refuse
@@ -409,7 +433,11 @@ The capability is a unique per-session token, so it doubles as the owner tag:
   is still listening on the port it names. That check runs on the sprite,
   where the answer is a loopback connect.
 - **A pointer left by a killed session** has nothing listening behind it, so
-  it is taken over silently rather than blocking every future run.
+  it is taken over silently rather than blocking every future run. The check
+  runs *before* the link comes up, which is the whole of it: once our own
+  forward is listening on that port, the probe reaches us and reports us as
+  the incumbent — and a stale pointer would then refuse every future run,
+  permanently, with nothing there to go and stop.
 - **Teardown removes only your own.** Stripping `ANTHROPIC_*` unconditionally
   was the half that actually broke the other session.
 
@@ -449,6 +477,8 @@ imp-proxy [-s SPRITE | -H HOST] [-p REMOTE_PORT] [--no-settings]
                       vars and set them yourself
       --allow GLOB    allow an extra request path through; repeatable
       --allow-any-path  disable the allowlist entirely
+      --clear         remove the far side's ANTHROPIC_* pointer, whoever left
+                      it, and say whether anything is still behind it
   -v, --verbose       log each proxied request (method, path, size)
 ```
 
