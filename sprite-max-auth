@@ -1,0 +1,256 @@
+#!/bin/bash
+# sprite-max-auth — forward a Claude Max subscription token to Fly Sprites.
+#
+# Sprites ship Claude Code preinstalled but unauthenticated. This mints a
+# long-lived, INFERENCE-ONLY OAuth token from your Max subscription (via
+# `claude setup-token`), keeps it in the macOS keychain, and installs it into a
+# sprite's ~/.claude/settings.json "env" block.
+#
+# Why settings.json and not an env var: `sprite exec` runs with a bare
+# environment — no ~/.bashrc, no /etc/environment — so exported vars do not
+# reach `sprite exec -- claude`. The settings.json "env" block is read by
+# Claude Code itself, so it works for exec, console, and survives self-update.
+#
+# Why setup-token and not mirroring ~/.claude/.credentials.json: your Mac's
+# session token refreshes and ROTATES. A sprite refreshing the same credential
+# invalidates your local session. setup-token is an independent credential,
+# scoped to inference only, revocable on its own.
+
+set -euo pipefail
+
+KEYCHAIN_SERVICE="sprite-max-oauth"
+STATE_DIR="$HOME/.config/sprite-max-auth"
+ENV_KEY="CLAUDE_CODE_OAUTH_TOKEN"
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*" >&2; }
+
+usage() {
+  cat <<'USAGE'
+sprite-max-auth <command> [options]
+
+Commands:
+  mint                  Instructions + run `claude setup-token`, then store
+  store                 Read a token from a hidden prompt into the keychain
+  push [-s NAME|--all]  Install the stored token into a sprite
+  verify [-s NAME|--all]  Make a real inference call on the sprite
+  status [-s NAME|--all]  Show local + remote credential state
+  remove [-s NAME|--all]  Strip the token from a sprite
+  forget                Delete the token from the local keychain
+
+With no -s and no --all, the sprite active for this directory is used
+(`sprite use`), matching plain `sprite exec` behavior.
+USAGE
+}
+
+have_token() { security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" >/dev/null 2>&1; }
+
+# Resolve target sprites into $TARGETS (newline separated). Empty = default sprite.
+TARGETS=""
+parse_targets() {
+  local all=0 name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) all=1; shift ;;
+      -s|--sprite) name="${2:-}"; [ -n "$name" ] || die "-s needs a sprite name"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unexpected argument: $1" ;;
+    esac
+  done
+  if [ "$all" -eq 1 ]; then
+    [ -z "$name" ] || die "--all and -s are mutually exclusive"
+    TARGETS=$(sprite list 2>/dev/null | sed -e 's/[[:space:]]*$//' -e '/^$/d')
+    [ -n "$TARGETS" ] || die "no sprites found"
+  else
+    TARGETS="$name"   # empty string means "whatever sprite is active here"
+  fi
+}
+
+# sprite CLI args for a target ("" -> no -s flag, use the active sprite)
+sflag() { if [ -n "$1" ]; then printf '%s' "-s $1"; fi; return 0; }
+
+label() { [ -n "$1" ] && printf '%s' "$1" || printf '%s' "(active sprite)"; }
+
+cmd_mint() {
+  cat >&2 <<'MSG'
+Minting a long-lived Claude Code token from your Max subscription.
+
+`claude setup-token` opens a browser, and prints a token starting with
+sk-ant-oat01-. It is INFERENCE ONLY: it cannot drive Remote Control or account
+actions, which is exactly what you want sitting on a remote VM.
+
+Copy the token when it appears, then paste it at the prompt that follows.
+
+MSG
+  claude setup-token || die "setup-token failed"
+  cmd_store
+}
+
+cmd_store() {
+  local token=""
+  printf 'Paste the sk-ant-oat01-... token (input hidden): ' >&2
+  IFS= read -rs token || true
+  printf '\n' >&2
+  [ -n "$token" ] || die "no token entered"
+  case "$token" in
+    sk-ant-oat01-*) ;;
+    *) info "warning: token does not start with sk-ant-oat01- — storing anyway" ;;
+  esac
+  # Note: the token transits argv here, briefly visible to `ps` on this Mac
+  # only. The alternative (security's own prompt) would make you retype it.
+  security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$USER" \
+    -D "Claude Max token for Fly Sprites" -T /usr/bin/security -w "$token"
+  mkdir -p "$STATE_DIR"
+  date -u '+%Y-%m-%dT%H:%M:%SZ' > "$STATE_DIR/minted"
+  info "stored in keychain as '$KEYCHAIN_SERVICE'"
+  info "setup-token credentials are long-lived; re-mint if inference starts 401ing."
+}
+
+cmd_forget() {
+  security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" >/dev/null 2>&1 \
+    && info "removed from keychain" || info "nothing stored in keychain"
+  rm -f "$STATE_DIR/minted"
+}
+
+push_one() {
+  local s="$1" sf rhome tokfile mergefile
+  sf=$(sflag "$s")
+  rhome=$(sprite exec $sf -- printenv HOME 2>/dev/null | tr -d '\r\n') || true
+  [ -n "$rhome" ] || die "$(label "$s"): could not determine remote HOME"
+
+  tokfile=$(mktemp "${TMPDIR:-/tmp}/smauth-tok.XXXXXX")
+  mergefile=$(mktemp "${TMPDIR:-/tmp}/smauth-merge.XXXXXX")
+  trap 'rm -f "$tokfile" "$mergefile"' EXIT INT TERM
+  chmod 600 "$tokfile"
+
+  # The token goes over as a file, never as argv, so it stays out of the
+  # sprite's process list and out of any control-plane command logging.
+  security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" -w > "$tokfile"
+
+  cat > "$mergefile" <<'PY_EOF'
+import json, os, sys
+
+home = os.path.expanduser("~")
+settings = os.path.join(home, ".claude", "settings.json")
+stage = os.path.join(home, ".claude", ".max-token.stage")
+
+with open(stage) as f:
+    token = f.read().strip()
+os.remove(stage)
+if not token:
+    sys.exit("staged token was empty")
+
+try:
+    with open(settings) as f:
+        data = json.load(f)
+except (IOError, OSError):
+    data = {}
+except ValueError:
+    sys.exit("existing settings.json is not valid JSON; refusing to overwrite")
+
+data.setdefault("env", {})["CLAUDE_CODE_OAUTH_TOKEN"] = token
+
+os.makedirs(os.path.dirname(settings), exist_ok=True)
+tmp = settings + ".smauth.tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, settings)
+print("installed")
+PY_EOF
+
+  sprite exec $sf -- mkdir -p "$rhome/.claude" >/dev/null
+  sprite file push $sf "$tokfile" "$rhome/.claude/.max-token.stage" >/dev/null
+  sprite file push $sf "$mergefile" "/tmp/smauth-merge.py" >/dev/null
+  local out
+  out=$(sprite exec $sf -- python3 /tmp/smauth-merge.py 2>&1) || {
+    sprite exec $sf -- rm -f /tmp/smauth-merge.py "$rhome/.claude/.max-token.stage" >/dev/null 2>&1 || true
+    die "$(label "$s"): $out"
+  }
+  sprite exec $sf -- rm -f /tmp/smauth-merge.py >/dev/null 2>&1 || true
+  rm -f "$tokfile" "$mergefile"
+  trap - EXIT INT TERM
+  info "$(label "$s"): $out"
+}
+
+verify_one() {
+  local s="$1" sf out
+  sf=$(sflag "$s")
+  # Branch on captured output, not exit status: `claude -p` reports auth
+  # failures on stdout and still exits 0.
+  out=$(sprite exec $sf --dir /tmp -- claude -p 'Reply with exactly: SPRITE_AUTH_OK' 2>&1 || true)
+  case "$out" in
+    *SPRITE_AUTH_OK*) info "$(label "$s"): OK — Max inference working"; return 0 ;;
+    *) info "$(label "$s"): FAILED — $(printf '%s' "$out" | head -3)"; return 1 ;;
+  esac
+}
+
+status_one() {
+  local s="$1" sf out
+  sf=$(sflag "$s")
+  out=$(sprite exec $sf -- python3 -c '
+import json, os, stat
+p = os.path.expanduser("~/.claude/settings.json")
+try:
+    d = json.load(open(p))
+except Exception:
+    print("no readable settings.json"); raise SystemExit
+tok = d.get("env", {}).get("CLAUDE_CODE_OAUTH_TOKEN")
+mode = stat.S_IMODE(os.stat(p).st_mode)
+print("token installed (%d chars), settings.json mode %o" % (len(tok), mode) if tok
+      else "no token installed")
+' 2>&1 || true)
+  info "$(label "$s"): $out"
+}
+
+for_each() {
+  local fn="$1" rc=0 t
+  if [ -z "$TARGETS" ]; then
+    "$fn" "" || rc=1
+  else
+    while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      "$fn" "$t" || rc=1
+    done <<< "$TARGETS"
+  fi
+  return $rc
+}
+
+main() {
+  local cmd="${1:-}"
+  [ $# -gt 0 ] && shift || true
+  case "$cmd" in
+    mint)   cmd_mint ;;
+    store)  cmd_store ;;
+    forget) cmd_forget ;;
+    push)
+      have_token || die "no token stored — run: $0 mint"
+      parse_targets "$@"; for_each push_one ;;
+    verify) parse_targets "$@"; for_each verify_one ;;
+    status)
+      have_token && info "local: token present in keychain ($(cat "$STATE_DIR/minted" 2>/dev/null || echo 'mint date unknown'))" \
+                 || info "local: no token in keychain"
+      parse_targets "$@"; for_each status_one ;;
+    remove)
+      parse_targets "$@"
+      remove_one() {
+        local sf; sf=$(sflag "$1")
+        sprite exec $sf -- python3 -c '
+import json, os
+p = os.path.expanduser("~/.claude/settings.json")
+d = json.load(open(p))
+env = d.get("env", {})
+if env.pop("CLAUDE_CODE_OAUTH_TOKEN", None) is None:
+    print("no token present"); raise SystemExit
+if not env: d.pop("env", None)
+json.dump(d, open(p, "w"), indent=2)
+print("token removed")' 2>&1 | while IFS= read -r l; do info "$(label "$1"): $l"; done
+      }
+      for_each remove_one ;;
+    ""|-h|--help|help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
