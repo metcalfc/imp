@@ -29,9 +29,9 @@ import argparse
 import base64
 import json
 import os
-import fnmatch
 import platform
 import posixpath
+import re
 import signal
 import socket
 import socketserver
@@ -41,6 +41,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 UPSTREAM = "https://api.anthropic.com"
@@ -171,28 +172,91 @@ def load_credential():
 # the injecting proxy — the only thing that ever sees the real token
 # --------------------------------------------------------------------------
 
-def normalize_path(raw):
-    """Path component of a request target, or None if it is not safe to use.
+# Decoding is repeated until it stops changing, so %252e%252e cannot hide a
+# traversal behind one round of unescaping. A handful of rounds is far more
+# than any real target needs; the cap only stops a pathological input.
+MAX_DECODE_ROUNDS = 5
 
-    Rejects anything that is not an absolute path, and anything whose normal
-    form differs from what was sent -- traversal like /v1/messages/../../x
-    would otherwise smuggle a request past a prefix check.
+
+def _fully_decoded(path):
+    """Percent-decode until stable, or None if it will not settle."""
+    for _ in range(MAX_DECODE_ROUNDS):
+        nxt = urllib.parse.unquote(path)
+        if nxt == path:
+            return path
+        path = nxt
+    return None
+
+
+def normalize_path(raw):
+    """Canonical path to authorize *and* to forward, or None if unsafe.
+
+    The value returned here is what actually goes upstream. Authorizing one
+    spelling and forwarding another is how an allowlist gets walked past:
+    %2e%2e survives posixpath.normpath untouched, so a check on the raw target
+    sees nothing wrong while whatever decodes it downstream sees `..`.
+
+    So: decode first, refuse anything whose decoded form is not already
+    normal, and re-encode that decoded form for the wire. What is checked and
+    what is sent are then the same string by construction.
     """
     if not raw.startswith("/"):
         return None
     path = raw.split("#", 1)[0].split("?", 1)[0]
-    if "\\" in path:
+
+    decoded = _fully_decoded(path)
+    if decoded is None or not decoded.startswith("/"):
         return None
-    norm = posixpath.normpath(path)
-    if norm != path and norm != path.rstrip("/"):
+    # Backslashes and control bytes have no place in a target and are a
+    # standard way to confuse whatever parses it next.
+    if "\\" in decoded or any(c < " " or c == "\x7f" for c in decoded):
         return None
-    return norm
+
+    norm = posixpath.normpath(decoded)
+    if norm != decoded and norm != decoded.rstrip("/"):
+        return None
+    return urllib.parse.quote(norm, safe="/")
+
+
+def _glob_to_re(pat):
+    """`*` matches within one path segment, `**` spans segments.
+
+    fnmatch's `*` crosses `/`, which makes /v1/models/* mean "anything under
+    /v1/models" rather than "one model id" -- a much wider grant than it
+    looks. Path globs should behave the way shell globs do.
+    """
+    out, i = [], 0
+    while i < len(pat):
+        c = pat[i]
+        if c == "*":
+            if pat.startswith("**", i):
+                out.append(".*")
+                i += 2
+            else:
+                out.append("[^/]*")
+                i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+_GLOB_CACHE = {}
 
 
 def path_allowed(path, patterns):
     if not patterns:            # --allow-any-path
         return True
-    return any(fnmatch.fnmatchcase(path, pat) for pat in patterns)
+    for pat in patterns:
+        rx = _GLOB_CACHE.get(pat)
+        if rx is None:
+            rx = _GLOB_CACHE[pat] = _glob_to_re(pat)
+        if rx.match(path):
+            return True
+    return False
 
 
 HOP = {"host", "accept-encoding", "content-length", "connection", "keep-alive",
@@ -255,6 +319,11 @@ def make_proxy_handler(cred, capability, verbose, allowed):
             if not path_allowed(path, allowed):
                 self._reject(403, "path %s is not on the allowlist" % path)
                 return
+            # Forward the target we authorized, not the one we were handed.
+            target = path
+            q = self.path.split("#", 1)[0].split("?", 1)
+            if len(q) == 2:
+                target += "?" + q[1]
 
             body = b""
             n = self.headers.get("Content-Length")
@@ -287,10 +356,10 @@ def make_proxy_handler(cred, capability, verbose, allowed):
                 fwd["anthropic-beta"] = ",".join(betas)
 
             if verbose:
-                log("%s %s (%d bytes up)" % (self.command, self.path, len(body)))
+                log("%s %s (%d bytes up)" % (self.command, target, len(body)))
 
             def attempt():
-                req = urllib.request.Request(UPSTREAM + self.path, data=body or None,
+                req = urllib.request.Request(UPSTREAM + target, data=body or None,
                                              headers=fwd, method=self.command)
                 try:
                     r = urllib.request.urlopen(req, timeout=600)

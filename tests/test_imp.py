@@ -80,6 +80,28 @@ class TestNormalizePath(unittest.TestCase):
     def test_trailing_slash_is_tolerated(self):
         self.assertEqual(imp.normalize_path("/v1/models/"), "/v1/models")
 
+    def test_percent_encoded_traversal_is_refused(self):
+        # %2e%2e survives posixpath.normpath untouched, so a check that does
+        # not decode first sees nothing wrong while the far end sees `..`.
+        self.assertIsNone(
+            imp.normalize_path("/v1/models/%2e%2e/%2e%2e/v1/organizations"))
+        self.assertIsNone(imp.normalize_path("/v1/models/%2E%2E/x"))
+        self.assertIsNone(imp.normalize_path("/v1/models/%2e%2e%2fx/y"))
+
+    def test_double_encoded_traversal_is_refused(self):
+        self.assertIsNone(
+            imp.normalize_path("/v1/models/%252e%252e/v1/organizations"))
+
+    def test_encoded_separator_is_refused(self):
+        self.assertIsNone(imp.normalize_path("/v1/models%2f..%2fv1/api_keys"))
+
+    def test_control_bytes_are_refused(self):
+        self.assertIsNone(imp.normalize_path("/v1/mess%00ages"))
+        self.assertIsNone(imp.normalize_path("/v1/messages%0d%0aX-Evil:%20y"))
+
+    def test_benign_encoding_round_trips(self):
+        self.assertEqual(imp.normalize_path("/v1/models/a%20b"), "/v1/models/a%20b")
+
 
 # --------------------------------------------------------------------------
 # the allowlist
@@ -102,7 +124,18 @@ class TestPathAllowed(unittest.TestCase):
     def test_extra_allow_glob_widens_it(self):
         widened = self.default + ("/v1/messages/batches*",)
         self.assertTrue(imp.path_allowed("/v1/messages/batches", widened))
-        self.assertTrue(imp.path_allowed("/v1/messages/batches/abc", widened))
+        self.assertTrue(imp.path_allowed("/v1/messages/batches_x", widened))
+        self.assertFalse(imp.path_allowed("/v1/api_keys", widened))
+
+    def test_star_does_not_cross_a_path_separator(self):
+        # /v1/models/* means one model id, not everything underneath it.
+        self.assertTrue(imp.path_allowed("/v1/models/claude-opus-4", self.default))
+        self.assertFalse(imp.path_allowed("/v1/models/a/b", self.default))
+        self.assertFalse(imp.path_allowed("/v1/models/anything/at/all", self.default))
+
+    def test_double_star_spans_segments_when_asked_for(self):
+        widened = self.default + ("/v1/messages/batches/**",)
+        self.assertTrue(imp.path_allowed("/v1/messages/batches/a/b", widened))
         self.assertFalse(imp.path_allowed("/v1/api_keys", widened))
 
     def test_empty_patterns_means_allow_any_path(self):
@@ -430,6 +463,27 @@ class TestAllowlistOverTheWire(ProxyTestCase):
         self.request(path="/v1/models?limit=5", method="GET", body=b"")
         _, path, _, _ = self.upstream.requests[0]
         self.assertEqual(path, "/v1/models?limit=5")
+
+    def test_encoded_traversal_never_reaches_upstream(self):
+        self.start()
+        status, _, _ = self.request(
+            path="/v1/models/%2e%2e/%2e%2e/v1/organizations")
+        self.assertEqual(status, 400)
+        self.assertEqual(self.upstream.requests, [])
+
+    def test_upstream_gets_the_target_we_authorized(self):
+        """Authorizing one spelling and forwarding another is the bug this
+        whole path exists to prevent."""
+        self.start()
+        self.request(path="/v1/models/", method="GET", body=b"")
+        _, path, _, _ = self.upstream.requests[0]
+        self.assertEqual(path, "/v1/models")
+
+    def test_star_does_not_grant_the_subtree_over_the_wire(self):
+        self.start()
+        status, _, _ = self.request(path="/v1/models/a/b", method="GET", body=b"")
+        self.assertEqual(status, 403)
+        self.assertEqual(self.upstream.requests, [])
 
 
 class TestCredentialRefresh(ProxyTestCase):

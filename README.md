@@ -262,10 +262,20 @@ logged locally:
 [imp] rejected: path /v1/api_keys is not on the allowlist
 ```
 
-Request targets are normalized first, and anything whose normal form differs
-from what was sent is refused as malformed — otherwise
-`/v1/messages/../../v1/organizations` would walk straight past a prefix check.
-Absolute-URL targets are refused for the same reason.
+Request targets are percent-decoded until the decoding stops changing them,
+then normalized, and anything whose normal form differs from what was sent is
+refused as malformed — otherwise `/v1/messages/../../v1/organizations` would
+walk straight past a prefix check, and `%2e%2e` would walk past *that* check by
+surviving normalization untouched. Absolute-URL targets, backslashes and
+control bytes are refused for the same reason.
+
+**The decoded, normalized target is what gets forwarded.** Authorizing one
+spelling and sending another is how an allowlist gets walked past even when
+every individual check looks right.
+
+In these patterns `*` matches within a single path segment and `**` spans
+segments, so `/v1/models/*` grants one model id rather than everything
+underneath it.
 
 Widen it with `--allow`, which takes globs and repeats:
 
