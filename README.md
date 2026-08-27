@@ -1,5 +1,7 @@
 # imp
 
+[![ci](https://github.com/metcalfc/imp/actions/workflows/ci.yml/badge.svg)](https://github.com/metcalfc/imp/actions/workflows/ci.yml)
+
 Lend a [Fly Sprite](https://docs.sprites.dev) your Claude Max subscription
 without ever giving it the credential.
 
@@ -9,6 +11,34 @@ imp -s my-sprite
 
 `claude` on the sprite now runs on your Max subscription. Ctrl-C revokes it
 instantly. The sprite never held anything worth stealing.
+
+*An imp is a small servant you lend out. It does the work, it carries nothing
+worth taking, and it goes away when you stop looking at it.*
+
+## Install
+
+Two files, no packaging, no dependencies. Drop them somewhere on your `PATH`:
+
+```sh
+git clone https://github.com/metcalfc/imp.git
+cd imp
+install -m 755 imp imp-auth /usr/local/bin/
+```
+
+Or run it straight out of the clone — `./imp -s my-sprite` works the same.
+
+You need `python3` and the [`sprite` CLI](https://docs.sprites.dev) on your
+machine, `python3` on the sprite, and a Claude Max subscription. Nothing is
+installed on the sprite: the relay is shipped as base64 in argv and never
+touches its disk.
+
+Then either log in with `claude` and go, or mint a dedicated token first —
+recommended, and explained under [Credential selection](#credential-selection):
+
+```sh
+imp-auth mint          # `claude setup-token`, stored in your keychain
+imp -s my-sprite
+```
 
 ---
 
@@ -263,17 +293,11 @@ without touching your own login. The live login also works — the proxy re-read
 it on a `401` so a long session survives the access token rolling underneath —
 but it is a broader credential than the job needs.
 
-## Requirements
-
-python3 and the `sprite` CLI on your machine; python3 on the sprite. macOS and
-Linux. No third-party packages on either end — the relay ships as base64 in
-argv and writes nothing to the sprite's disk.
-
 ## Usage
 
 ```
 imp [-s SPRITE] [-p REMOTE_PORT] [--no-settings]
-                 [--allow GLOB] [--allow-any-path] [-v]
+    [--allow GLOB] [--allow-any-path] [-v]
 
   -s, --sprite        sprite name (default: the one `sprite use` selected in
                       this directory; without either, it exits and says so)
@@ -285,9 +309,38 @@ imp [-s SPRITE] [-p REMOTE_PORT] [--no-settings]
   -v, --verbose       log each proxied request (method, path, size)
 ```
 
+## Tests
+
+Stdlib only, no fixtures to install, no sprite required:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+They cover the parts the security claims rest on. The path allowlist and
+target normalization are exercised directly and over the wire, including
+`/v1/messages/../../v1/organizations`. A stand-in upstream records exactly what
+crossed the boundary, so "the capability never reaches Anthropic" and "the real
+token is attached only after the allowlist passes" are assertions rather than
+prose. The relay is run as shipped — base64 through `python3 -c` — and a 256KB
+blob of every byte value is round-tripped in both directions to hold the 8-bit
+clean claim honest, plus the orphan watchdog is timed out for real to confirm
+it frees the port on its own.
+
+CI runs them on Linux and macOS against Python 3.9 through 3.13, alongside
+`shellcheck` and `bash -n` on `imp-auth`.
+
 ## See also
 
-`imp-auth` in this repo is the earlier design — it pushes a real token
-into the sprite's `settings.json` and leaves it there. It is the right tool only
-when you need a sprite to keep working while you are disconnected, and it
-carries every row in the left column of the table above.
+`imp-auth` in this repo does two jobs. `imp-auth mint` / `store` / `forget`
+manage the keychain entry that `imp` reads — that part you want, and the Install
+section above uses it.
+
+`imp-auth push` is the earlier design: it copies the real token into the
+sprite's `settings.json` and leaves it there. It is the right tool only when you
+need a sprite to keep working while you are disconnected, and it carries every
+row in the left column of the table above.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

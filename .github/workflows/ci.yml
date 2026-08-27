@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # A quoting break otherwise reads as a style complaint rather than
+      # "does not parse".
+      - name: bash -n
+        run: bash -n imp-auth
+
+      - name: shellcheck
+        run: shellcheck imp-auth
+
+      - name: py_compile
+        run: python3 -m py_compile imp
+
+      - name: ruff
+        run: |
+          pip install --disable-pip-version-check --quiet ruff
+          ruff check --select E9,F63,F7,F82 imp tests/
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.9", "3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # No third-party packages on either end -- that is a feature, so the
+      # test run installs nothing either.
+      - name: unittest
+        run: python3 -W error::ResourceWarning -m unittest discover -s tests -v

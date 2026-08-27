@@ -20,7 +20,6 @@ set -euo pipefail
 
 KEYCHAIN_SERVICE="imp-oauth"
 STATE_DIR="$HOME/.config/imp"
-ENV_KEY="CLAUDE_CODE_OAUTH_TOKEN"
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 info() { printf '%s\n' "$*" >&2; }
@@ -66,7 +65,10 @@ parse_targets() {
   fi
 }
 
-# sprite CLI args for a target ("" -> no -s flag, use the active sprite)
+# sprite CLI args for a target ("" -> no -s flag, use the active sprite).
+# Callers use $sf UNQUOTED on purpose: the word split is what turns "" into no
+# argument at all. An array would be the tidy alternative, but bash 3.2 (what
+# macOS ships) errors on "${arr[@]}" for an empty array under `set -u`.
 sflag() { if [ -n "$1" ]; then printf '%s' "-s $1"; fi; return 0; }
 
 label() { [ -n "$1" ] && printf '%s' "$1" || printf '%s' "(active sprite)"; }
@@ -107,11 +109,15 @@ cmd_store() {
 }
 
 cmd_forget() {
-  security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" >/dev/null 2>&1 \
-    && info "removed from keychain" || info "nothing stored in keychain"
+  if security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" >/dev/null 2>&1; then
+    info "removed from keychain"
+  else
+    info "nothing stored in keychain"
+  fi
   rm -f "$STATE_DIR/minted"
 }
 
+# shellcheck disable=SC2086  # $sf must word-split; see sflag()
 push_one() {
   local s="$1" sf rhome tokfile mergefile
   sf=$(sflag "$s")
@@ -174,6 +180,7 @@ PY_EOF
   info "$(label "$s"): $out"
 }
 
+# shellcheck disable=SC2086  # $sf must word-split; see sflag()
 verify_one() {
   local s="$1" sf out
   sf=$(sflag "$s")
@@ -186,6 +193,7 @@ verify_one() {
   esac
 }
 
+# shellcheck disable=SC2086  # $sf must word-split; see sflag()
 status_one() {
   local s="$1" sf out
   sf=$(sflag "$s")
@@ -229,11 +237,15 @@ main() {
       parse_targets "$@"; for_each push_one ;;
     verify) parse_targets "$@"; for_each verify_one ;;
     status)
-      have_token && info "local: token present in keychain ($(cat "$STATE_DIR/minted" 2>/dev/null || echo 'mint date unknown'))" \
-                 || info "local: no token in keychain"
+      if have_token; then
+        info "local: token present in keychain ($(cat "$STATE_DIR/minted" 2>/dev/null || echo 'mint date unknown'))"
+      else
+        info "local: no token in keychain"
+      fi
       parse_targets "$@"; for_each status_one ;;
     remove)
       parse_targets "$@"
+      # shellcheck disable=SC2086  # $sf must word-split; see sflag()
       remove_one() {
         local sf; sf=$(sflag "$1")
         sprite exec $sf -- python3 -c '
