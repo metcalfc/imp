@@ -53,3 +53,13 @@ jobs:
       # test run installs nothing either.
       - name: unittest
         run: python3 -W error::ResourceWarning -m unittest discover -s tests -v
+
+      # The lint job runs bash 5. macOS still ships /bin/bash 3.2.57, which is
+      # what imp-auth actually has to parse there -- and it is the only place
+      # CI can see that. Explicitly /bin/bash: Homebrew's bash 5 is on PATH on
+      # these runners and would hide the breakage.
+      - name: /bin/bash 3.2 parses imp-auth
+        if: runner.os == 'macOS'
+        run: |
+          /bin/bash --version | head -1
+          /bin/bash -n imp-auth
