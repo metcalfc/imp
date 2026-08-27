@@ -286,6 +286,23 @@ imp -s my-sprite --allow '/v1/messages/batches*'
 `--allow-any-path` turns the check off entirely. It is the wrong default and
 the log says so at startup.
 
+## Several claudes on one sprite
+
+Each `claude` on the sprite is its own stream through the one ssh channel, so
+the demultiplexer at each end must never block on any single one of them. It
+does not: every stream has its own write queue and writer thread, and the
+frame reader only ever hands off.
+
+That matters more than it looks. The frame loop is also what refreshes the
+relay's idle timestamp, so a reader wedged on one stalled socket stops the
+watchdog's clock — and thirty seconds later the watchdog concludes the
+operator is gone and tears down the session. One paused pane would take every
+other `claude` with it.
+
+A stream that buffers past 8 MB without draining is dropped on its own; a
+`claude` that pauses to render a long response is slow, not stuck, and 8 MB is
+a long way past slow.
+
 ## Limits
 
 The sprite chooses the numbers in its own requests, so none of them may turn

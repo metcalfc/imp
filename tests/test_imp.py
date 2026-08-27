@@ -787,6 +787,15 @@ class TestMuxStreamBounds(unittest.TestCase):
             i += imp.HDR.size + ln
         return out
 
+    def wait_for_frame(self, proc, want, timeout=5):
+        """send() enqueues; a writer thread drains. Give it a moment."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if want in self.frames_sent(proc):
+                return True
+            time.sleep(0.02)
+        return False
+
     def test_open_beyond_the_cap_is_refused(self):
         proc = self.FakeProc()
         mux = imp.Mux(proc, 1, False)
@@ -795,15 +804,19 @@ class TestMuxStreamBounds(unittest.TestCase):
         mux.socks = {i: None for i in range(imp.MAX_STREAMS)}
         mux._open(9999)
         self.assertNotIn(9999, mux.socks)
-        self.assertIn((9999, imp.T_CLOSE), self.frames_sent(proc))
+        self.assertTrue(self.wait_for_frame(proc, (9999, imp.T_CLOSE)),
+                        "expected a T_CLOSE for the refused stream")
 
     def test_duplicate_sid_closes_the_socket_it_replaces(self):
         proc = self.FakeProc()
         mux = imp.Mux(proc, 1, False)
         a, b = socket.socketpair()
         try:
-            mux.socks = {7: a}
+            mux.socks = {7: imp.Stream(a)}
             mux._open(7)          # connect to port 1 fails, but `a` must close
+            deadline = time.time() + 5
+            while time.time() < deadline and a.fileno() != -1:
+                time.sleep(0.02)
             with self.assertRaises(OSError):
                 a.send(b"x")
         finally:
@@ -812,6 +825,116 @@ class TestMuxStreamBounds(unittest.TestCase):
                     sk.close()
                 except OSError:
                     pass
+
+
+class TestStreamBuffering(unittest.TestCase):
+    def test_feed_never_blocks_and_refuses_past_the_cap(self):
+        a, b = socket.socketpair()
+        st = imp.Stream(a)
+        try:
+            self.assertTrue(st.feed(b"small"))
+            # One chunk larger than the whole allowance: the peer cannot be
+            # keeping up, and feed must say so rather than wait.
+            self.assertFalse(st.feed(b"x" * (imp.MAX_STREAM_BUFFER + 1)))
+        finally:
+            st.close()
+            b.close()
+
+    def test_feed_on_a_closed_stream_is_refused(self):
+        a, b = socket.socketpair()
+        st = imp.Stream(a)
+        st.close()
+        try:
+            self.assertFalse(st.feed(b"x"))
+        finally:
+            b.close()
+
+
+class TestHeadOfLineBlocking(unittest.TestCase):
+    """The reason this matters: several `claude` sessions on one sprite.
+
+    One that stops draining must not stall the others -- and because the
+    frame reader is also what refreshes the relay's idle timestamp, stalling
+    it would trip the watchdog into killing the whole session.
+    """
+
+    def setUp(self):
+        self.port = free_port()
+        self.relay = RelayHarness(self.port)
+        self.assertEqual(self.relay.read_frame()[1], imp.T_PING)
+
+    def tearDown(self):
+        self.relay.close()
+
+    def open_stream(self, rcvbuf=None):
+        conn = socket.socket()
+        if rcvbuf is not None:
+            # A small receive buffer makes the relay's send buffer fill fast
+            # and stay full. Without this the test proves nothing: loopback
+            # buffers auto-tune into the megabytes, so a blocking relay
+            # absorbs everything a reasonable test would send and looks fine.
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        conn.connect(("127.0.0.1", self.port))
+        sid, t, _ = self.relay.read_frame()
+        self.assertEqual(t, imp.T_OPEN)
+        return sid, conn
+
+    def flood(self, sid, mb=1):
+        """Push at a stream from a thread -- if the relay ever stops reading,
+        these writes block rather than failing the test outright."""
+        def go():
+            try:
+                for _ in range(mb * 16):
+                    self.relay.send(sid, imp.T_DATA, b"z" * 65536)
+            except OSError:
+                pass
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        return t
+
+    def test_a_stalled_consumer_does_not_block_another_stream(self):
+        stalled_sid, stalled = self.open_stream(rcvbuf=4096)
+        live_sid, live = self.open_stream()
+        try:
+            self.flood(stalled_sid, mb=1)     # nothing ever recv()s on it
+            time.sleep(1.0)                   # let it wedge if it is going to
+            try:
+                self.relay.send(live_sid, imp.T_DATA, b"STILL-FLOWING")
+            except OSError as e:
+                # A relay wedged on one socket stops reading frames; its idle
+                # timestamp then never advances and the watchdog kills it.
+                self.fail("relay stopped reading frames while one consumer "
+                          "was stalled (%r)" % (e,))
+
+            live.settimeout(8)
+            got = b""
+            while b"STILL-FLOWING" not in got:
+                more = live.recv(65536)
+                if not more:
+                    self.fail("the relay closed the healthy stream -- a "
+                              "stalled consumer took the whole session down")
+                got += more
+        finally:
+            for c in (stalled, live):
+                try:
+                    c.close()
+                except OSError:
+                    pass
+
+    def test_the_relay_keeps_accepting_while_a_consumer_is_stalled(self):
+        """The frame loop is also what refreshes the idle timestamp, so a
+        relay wedged on one socket eventually kills itself."""
+        stalled_sid, stalled = self.open_stream(rcvbuf=4096)
+        try:
+            self.flood(stalled_sid, mb=1)
+            time.sleep(1.0)
+            _, conn = self.open_stream()      # still responsive
+            conn.close()
+        finally:
+            try:
+                stalled.close()
+            except OSError:
+                pass
 
 
 class TestRelayWatchdog(unittest.TestCase):

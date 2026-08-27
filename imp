@@ -31,6 +31,7 @@ import json
 import os
 import platform
 import posixpath
+import queue
 import re
 import signal
 import socket
@@ -76,6 +77,9 @@ RELAY_IDLE_TIMEOUT = 30.0
 MAX_BODY = 64 * 1024 * 1024     # generous next to a large image request
 MAX_FRAME = 1024 * 1024         # the relay never sends more than 64KB
 MAX_STREAMS = 256               # concurrent proxied connections
+# Per-stream write buffer before a consumer is written off as stuck. A claude
+# that pauses to render a long response is slow, not stuck -- be generous.
+MAX_STREAM_BUFFER = 8 * 1024 * 1024
 SETTINGS_TIMEOUT = 30.0         # ssh round trip for settings.json
 
 
@@ -486,19 +490,27 @@ class ProxyServer(socketserver.ThreadingTCPServer):
 # --------------------------------------------------------------------------
 
 RELAY_SRC = r'''
-import os, socket, struct, sys, threading, time
+import os, queue, socket, struct, sys, threading, time
 
 PORT = int(sys.argv[1])
 IDLE = float(sys.argv[2])
+# Per-stream buffer before a consumer is written off as stuck. Generous: a
+# claude that pauses to render a long response is slow, not stuck.
+MAX_BUF = 8 * 1024 * 1024
 HDR = struct.Struct("!IBI")
 T_OPEN, T_DATA, T_CLOSE, T_PING = 1, 2, 3, 4
 
 out = sys.stdout.buffer
 inp = sys.stdin.buffer
-outlock = threading.Lock()
 streams = {}
 slock = threading.Lock()
 last = [time.time()]
+
+# A bounded queue drained by one writer thread. Producers are per-stream pump
+# threads, so blocking one when the channel backs up is correct backpressure
+# for that stream alone -- unlike holding a lock across the write, which
+# stalled every stream at once.
+outq = queue.Queue(maxsize=256)
 
 
 def drop(conn):
@@ -516,30 +528,84 @@ def drop(conn):
 
 
 def send(sid, t, payload=b""):
-    with outlock:
+    outq.put(HDR.pack(sid, t, len(payload)) + payload)
+
+
+def chan_writer():
+    while True:
+        buf = outq.get()
         try:
-            out.write(HDR.pack(sid, t, len(payload)))
-            if payload:
-                out.write(payload)
+            out.write(buf)
             out.flush()
         except (OSError, ValueError):
             os._exit(0)
 
 
-def pump(sid, conn):
+class Stream(object):
+    """A socket plus its own writer thread.
+
+    The frame reader must never block: one consumer that stops draining would
+    otherwise stall every other stream, and -- because the reader is also what
+    refreshes the idle timestamp -- trip the watchdog into killing the whole
+    session 30s later.
+    """
+
+    def __init__(self, sid, conn):
+        self.sid = sid
+        self.conn = conn
+        self.q = queue.Queue()
+        self.buffered = 0
+        self.lock = threading.Lock()
+        self.closed = False
+        threading.Thread(target=self.writer, daemon=True).start()
+
+    def feed(self, data):
+        """Hand off without blocking. True if accepted."""
+        with self.lock:
+            if self.closed:
+                return False
+            if self.buffered + len(data) > MAX_BUF:
+                return False        # genuinely stuck; caller drops the stream
+            self.buffered += len(data)
+        self.q.put(data)
+        return True
+
+    def writer(self):
+        while True:
+            data = self.q.get()
+            if data is None:
+                break
+            try:
+                self.conn.sendall(data)
+            except OSError:
+                break
+            with self.lock:
+                self.buffered -= len(data)
+        self.close()
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+        self.q.put(None)
+        drop(self.conn)
+
+
+def pump(sid, st):
     try:
         while True:
-            b = conn.recv(65536)
+            b = st.conn.recv(65536)
             if not b:
                 break
-            send(sid, T_DATA, b)
-    except OSError:
+            send(sid, T_DATA, b)     # may block on outq; that is this stream's
+    except OSError:                  # backpressure, not everyone else's
         pass
     finally:
         with slock:
             streams.pop(sid, None)
         send(sid, T_CLOSE)
-        drop(conn)
+        st.close()
 
 
 def acceptor():
@@ -561,10 +627,11 @@ def acceptor():
     while True:
         conn, _ = srv.accept()
         n += 1
+        st = Stream(n, conn)
         with slock:
-            streams[n] = conn
+            streams[n] = st
         send(n, T_OPEN)
-        threading.Thread(target=pump, args=(n, conn), daemon=True).start()
+        threading.Thread(target=pump, args=(n, st), daemon=True).start()
 
 
 def watchdog():
@@ -588,6 +655,7 @@ def readexact(n):
     return buf
 
 
+threading.Thread(target=chan_writer, daemon=True).start()
 threading.Thread(target=acceptor, daemon=True).start()
 threading.Thread(target=watchdog, daemon=True).start()
 
@@ -603,20 +671,21 @@ while True:
     if t == T_PING:
         continue
     with slock:
-        conn = streams.get(sid)
-    if conn is None:
+        st = streams.get(sid)
+    if st is None:
         continue
     if t == T_DATA:
-        try:
-            conn.sendall(payload)
-        except OSError:
+        if not st.feed(payload):
+            # Buffered past MAX_BUF: this consumer is not coming back. Drop
+            # it alone rather than letting it hold up the demultiplexer.
             with slock:
                 streams.pop(sid, None)
-            drop(conn)
+            send(sid, T_CLOSE)
+            st.close()
     elif t == T_CLOSE:
         with slock:
             streams.pop(sid, None)
-        drop(conn)
+        st.close()
 os._exit(0)
 '''
 
@@ -624,6 +693,57 @@ os._exit(0)
 # --------------------------------------------------------------------------
 # this side of the mux
 # --------------------------------------------------------------------------
+
+class Stream(object):
+    """A proxied socket plus its own writer thread.
+
+    The frame reader must never block on one of these. With a single `claude`
+    on the sprite a blocking write is just backpressure, but with several,
+    one that stops draining would stall every other stream -- and since the
+    reader is also what refreshes the relay's idle timestamp, the watchdog
+    would then tear the whole session down 30s later.
+    """
+
+    def __init__(self, conn):
+        self.conn = conn
+        self.q = queue.Queue()
+        self.buffered = 0
+        self.lock = threading.Lock()
+        self.closed = False
+        threading.Thread(target=self._writer, daemon=True).start()
+
+    def feed(self, data):
+        """Hand off without blocking. False means the peer is not draining."""
+        with self.lock:
+            if self.closed:
+                return False
+            if self.buffered + len(data) > MAX_STREAM_BUFFER:
+                return False
+            self.buffered += len(data)
+        self.q.put(data)
+        return True
+
+    def _writer(self):
+        while True:
+            data = self.q.get()
+            if data is None:
+                break
+            try:
+                self.conn.sendall(data)
+            except OSError:
+                break
+            with self.lock:
+                self.buffered -= len(data)
+        self.close()
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+        self.q.put(None)
+        _drop(self.conn)
+
 
 class Mux(object):
     """Demultiplexes the sprite's framed stdout into local proxy connections."""
@@ -634,24 +754,36 @@ class Mux(object):
         self.verbose = verbose
         self.socks = {}
         self.lock = threading.Lock()
-        self.wlock = threading.Lock()
         self.alive = True
         self.ready = threading.Event()
+        # Bounded, drained by one writer thread. Producers are per-stream
+        # pump threads, so blocking one when the pipe backs up is that
+        # stream's backpressure -- not a lock every other stream waits on.
+        self.outq = queue.Queue(maxsize=256)
+        threading.Thread(target=self._chan_writer, daemon=True).start()
 
     def send(self, sid, t, payload=b""):
-        with self.wlock:
+        try:
+            self.outq.put(HDR.pack(sid, t, len(payload)) + payload)
+        except Exception:
+            self.alive = False
+
+    def _chan_writer(self):
+        while True:
+            buf = self.outq.get()
+            if buf is None:
+                break
             try:
-                self.proc.stdin.write(HDR.pack(sid, t, len(payload)))
-                if payload:
-                    self.proc.stdin.write(payload)
+                self.proc.stdin.write(buf)
                 self.proc.stdin.flush()
             except (OSError, ValueError):
                 self.alive = False
+                break
 
-    def _pump(self, sid, conn):
+    def _pump(self, sid, st):
         try:
             while True:
-                b = conn.recv(65536)
+                b = st.conn.recv(65536)
                 if not b:
                     break
                 self.send(sid, T_DATA, b)
@@ -661,7 +793,7 @@ class Mux(object):
             with self.lock:
                 self.socks.pop(sid, None)
             self.send(sid, T_CLOSE)
-            _drop(conn)
+            st.close()
 
     def _open(self, sid):
         with self.lock:
@@ -672,7 +804,7 @@ class Mux(object):
             stale = self.socks.pop(sid, None)
         if stale is not None:
             # A repeated SID used to overwrite the entry and leak the socket.
-            _drop(stale)
+            stale.close()
         try:
             conn = socket.create_connection(("127.0.0.1", self.proxy_port), timeout=10)
             conn.settimeout(None)
@@ -680,9 +812,10 @@ class Mux(object):
             log("could not reach local proxy: %r" % (e,))
             self.send(sid, T_CLOSE)
             return
+        st = Stream(conn)
         with self.lock:
-            self.socks[sid] = conn
-        threading.Thread(target=self._pump, args=(sid, conn), daemon=True).start()
+            self.socks[sid] = st
+        threading.Thread(target=self._pump, args=(sid, st), daemon=True).start()
 
     def pinger(self):
         while self.alive:
@@ -723,18 +856,19 @@ class Mux(object):
                 self._open(sid)
             elif t == T_DATA:
                 with self.lock:
-                    conn = self.socks.get(sid)
-                if conn is not None:
-                    try:
-                        conn.sendall(payload)
-                    except OSError:
-                        with self.lock:
-                            self.socks.pop(sid, None)
+                    st = self.socks.get(sid)
+                if st is not None and not st.feed(payload):
+                    log("stream %d buffered past %d bytes without draining -- "
+                        "dropping it" % (sid, MAX_STREAM_BUFFER))
+                    with self.lock:
+                        self.socks.pop(sid, None)
+                    self.send(sid, T_CLOSE)
+                    st.close()
             elif t == T_CLOSE:
                 with self.lock:
-                    conn = self.socks.pop(sid, None)
-                if conn is not None:
-                    _drop(conn)
+                    st = self.socks.pop(sid, None)
+                if st is not None:
+                    st.close()
         self.alive = False
         self.ready.set()
 
