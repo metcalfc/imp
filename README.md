@@ -2,8 +2,8 @@
 
 [![ci](https://github.com/metcalfc/imp/actions/workflows/ci.yml/badge.svg)](https://github.com/metcalfc/imp/actions/workflows/ci.yml)
 
-Lend a [Fly Sprite](https://docs.sprites.dev) your Claude Max subscription
-without ever giving it the credential.
+Lend a [Fly Sprite](https://docs.sprites.dev) — or any host you can `ssh` to —
+your Claude Max subscription without ever giving it the credential.
 
 ```
 imp -s my-sprite
@@ -21,6 +21,7 @@ was:
 
 ```
 imp-proxy -s my-sprite      # then `sprite console` wherever you like
+imp-proxy -H my-box         # any ssh destination, ssh_config aliases included
 ```
 
 *An imp is a small servant you lend out. It does the work, it carries nothing
@@ -132,6 +133,31 @@ nor `-A`. So the tunnel is a userspace reimplementation of remote forwarding,
 multiplexed over the one ssh stdio channel, which is 8-bit clean in both
 directions (verified: 256KB round-tripped byte-identical).
 
+### Two transports
+
+`-H` targets a host that speaks ordinary ssh, where `-R` does natively what the
+relay exists to work around. That path skips the relay entirely — no framing, no
+mux, no idle watchdog, and nothing for the far side to run but `echo` and `cat`.
+Add `--no-settings` and it needs no `python3` either.
+
+Two options carry the properties the relay had by construction:
+
+| | |
+|---|---|
+| `-R 127.0.0.1:PORT:127.0.0.1:PORT` | spelled out. `-R 8080:…` binds `0.0.0.0` wherever `GatewayPorts yes` is set, which would put the capability endpoint on the network |
+| `ExitOnForwardFailure=yes` | otherwise a taken remote port is a warning and a session that silently has no proxy behind it — the relay reports that by failing to bind and never pinging |
+
+Host key checking is left alone for `-H`. Off is right for the sprite, whose
+ProxyCommand mints a fresh transport with no stable key to pin; a machine you
+own is not that.
+
+Not every host that gives you a shell gives you `-R` — a Go-based ssh server
+often implements no remote forwarding at all. One command settles it:
+
+```sh
+ssh -R 127.0.0.1:8080:127.0.0.1:9 -o ExitOnForwardFailure=yes HOST 'echo FORWARD_OK'
+```
+
 ## What crosses the boundary, per request
 
 ```mermaid
@@ -220,6 +246,15 @@ Verified against a live sprite:
 | clean exit teardown | `NO ENV BLOCK` — settings.json restored |
 | closing the terminal or the tmux pane (SIGHUP) | same as a clean exit — settings.json restored |
 | Ctrl-C in the proxy pane | teardown runs, exit 0, and the pane closes itself — a pane that stays is one that failed |
+
+And against a real ssh host (`-H`, Linux, OpenSSH client, Go server):
+
+| Test | Result |
+|---|---|
+| `claude -p` on the far side | `TUNNEL_OK`, over `-R` with no relay in the process tree |
+| settings.json installed | base URL + capability, written over a second ssh |
+| Ctrl-C | `settings.json` back to `{}`, forward gone, exit 0 |
+| `claude` after Ctrl-C | `Not logged in · Please run /login` |
 | `kill -9`, no teardown, 30s later | relay gone, port freed, only an inert capability left |
 
 ## Blast radius
@@ -402,13 +437,15 @@ but it is a broader credential than the job needs.
 ## Usage
 
 ```
-imp-proxy [-s SPRITE] [-p REMOTE_PORT] [--no-settings]
+imp-proxy [-s SPRITE | -H HOST] [-p REMOTE_PORT] [--no-settings]
           [--allow GLOB] [--allow-any-path] [-v]
 
   -s, --sprite        sprite name (default: the one `sprite use` selected in
                       this directory; without either, it exits and says so)
-  -p, --remote-port   port the relay listens on inside the sprite (default 8080)
-      --no-settings   don't touch the sprite's settings.json; print the env
+  -H, --host          an ssh destination instead of a sprite -- anything ssh
+                      accepts, including a Host from your ssh config
+  -p, --remote-port   port to listen on at the far end (default 8080)
+      --no-settings   don't touch the far side's settings.json; print the env
                       vars and set them yourself
       --allow GLOB    allow an extra request path through; repeatable
       --allow-any-path  disable the allowlist entirely
