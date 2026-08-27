@@ -187,6 +187,7 @@ Verified against a live sprite:
 | `claude -p` through the tunnel | `TUNNEL_OK` — incl. an 83KB request |
 | Ctrl-C, then `claude` on the sprite | `Not logged in · Please run /login` |
 | clean exit teardown | `NO ENV BLOCK` — settings.json restored |
+| closing the terminal or the tmux pane (SIGHUP) | same as a clean exit — settings.json restored |
 | `kill -9`, no teardown, 30s later | relay gone, port freed, only an inert capability left |
 
 ## Blast radius

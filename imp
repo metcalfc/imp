@@ -1105,8 +1105,13 @@ def main():
         except OSError:
             pass
 
-    signal.signal(signal.SIGINT, on_signal)
-    signal.signal(signal.SIGTERM, on_signal)
+    # SIGHUP too, and not for tidiness: Python's default for it kills the
+    # process outright, so the teardown below -- the one that clears the
+    # sprite's settings.json -- never runs. A terminal closing or a tmux pane
+    # being destroyed both arrive that way, which makes the ordinary way to
+    # end a session the one path that skips cleanup.
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, on_signal)
 
     mux = Mux(proc, proxy_port, args.verbose)
     threading.Thread(target=mux.run, daemon=True).start()
