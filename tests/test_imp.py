@@ -381,6 +381,66 @@ class TestCapabilityEnforcement(ProxyTestCase):
         self.assertEqual(status, 200)
 
 
+class TestRejectionLogging(ProxyTestCase):
+    """A rejection has to say *what* was rejected to be worth reading."""
+
+    def setUp(self):
+        super().setUp()
+        self.lines = []
+        self._real_log = imp.log
+        imp.log = lambda *a: self.lines.append(" ".join(str(x) for x in a))
+
+    def tearDown(self):
+        imp.log = self._real_log
+        super().tearDown()
+
+    def rejection(self):
+        hits = [l for l in self.lines if l.startswith("rejected:")]
+        self.assertEqual(len(hits), 1, self.lines)
+        return hits[0]
+
+    def test_stale_capability_names_the_path(self):
+        # The line a restarted imp prints while an old claude is still holding
+        # the previous session's capability.
+        self.start()
+        self.request(auth="Bearer stale")
+        line = self.rejection()
+        self.assertIn("bad or missing session capability", line)
+        self.assertIn("POST /v1/messages", line)
+
+    def test_disallowed_path_is_named(self):
+        self.start()
+        self.request(path="/v1/organizations/me")
+        self.assertIn("/v1/organizations/me", self.rejection())
+
+    def test_query_string_is_kept_for_diagnosis(self):
+        self.start()
+        self.request(path="/v1/messages?beta=true", auth="Bearer stale")
+        self.assertIn("/v1/messages?beta=true", self.rejection())
+
+    def test_escape_sequences_never_reach_the_terminal(self):
+        # The target is the sprite's to choose; it does not get to drive the
+        # cursor of whoever is watching imp's output.
+        self.start()
+        self.request(path="/v1/\x1b[31mmessages\x07")
+        line = self.rejection()
+        self.assertNotIn("\x1b", line)
+        self.assertNotIn("\x07", line)
+        self.assertIn("/v1/?[31mmessages?", line)
+
+    def test_a_huge_target_is_clipped(self):
+        self.start()
+        self.request(path="/v1/messages?x=" + "a" * 4000, auth="Bearer stale")
+        line = self.rejection()
+        self.assertLess(len(line), 200)
+        self.assertIn("...)", line)
+
+    def test_the_capability_is_never_in_a_rejection_line(self):
+        self.start()
+        self.request(auth="Bearer " + CAPABILITY, path="/v1/api_keys")
+        self.assertNotIn(CAPABILITY, self.rejection())
+
+
 class TestTokenInjection(ProxyTestCase):
     def test_real_token_replaces_the_capability(self):
         self.start()

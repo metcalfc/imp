@@ -258,9 +258,20 @@ Anything else is refused with a 403 **before** the real token is attached, and
 logged locally:
 
 ```
-[imp] rejected: path /v1/organizations/me is not on the allowlist
-[imp] rejected: path /v1/api_keys is not on the allowlist
+[imp] rejected: path is not on the allowlist (POST /v1/organizations/me)
+[imp] rejected: path is not on the allowlist (GET /v1/api_keys)
 ```
+
+Every rejection carries the method and target that caused it, so a line like
+
+```
+[imp] rejected: bad or missing session capability (POST /v1/messages)
+```
+
+is legible on sight: that one is a `claude` still holding the capability from a
+previous imp session, which is expected once after a restart and suspicious if
+it repeats. The target is the sprite's to choose, so it is reduced to printable
+ASCII and clipped at 120 characters before it reaches your terminal.
 
 Request targets are percent-decoded until the decoding stops changing them,
 then normalized, and anything whose normal form differs from what was sent is

@@ -346,8 +346,18 @@ def make_proxy_handler(cred, capability, verbose, allowed):
         def log_message(self, fmt, *args):
             pass
 
+        # The target is the sprite's to choose, so it reaches our terminal
+        # only as printable ASCII, clipped: a request line can carry 64 KB of
+        # escape sequences, and a rejection is exactly when it is unvetted.
+        def _safe_target(self):
+            raw = getattr(self, "path", None) or "-"
+            clean = "".join(c if " " <= c <= "~" else "?" for c in raw)
+            return clean if len(clean) <= 120 else clean[:120] + "..."
+
         def _reject(self, code, why):
-            log("rejected: %s" % why)
+            # Logged, not returned: the body says what was wrong, and the
+            # sprite already knows what it asked for.
+            log("rejected: %s (%s %s)" % (why, self.command, self._safe_target()))
             body = json.dumps({"type": "error", "error": {
                 "type": "authentication_error", "message": why}}).encode()
             self.send_response(code)
@@ -367,7 +377,7 @@ def make_proxy_handler(cred, capability, verbose, allowed):
                 self._reject(400, "malformed request path")
                 return
             if not path_allowed(path, allowed):
-                self._reject(403, "path %s is not on the allowlist" % path)
+                self._reject(403, "path is not on the allowlist")
                 return
             # Forward the target we authorized, not the one we were handed.
             target = path
