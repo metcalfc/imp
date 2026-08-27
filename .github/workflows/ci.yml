@@ -22,7 +22,7 @@ jobs:
       # A quoting break otherwise reads as a style complaint rather than
       # "does not parse".
       - name: bash -n
-        run: bash -n imp-auth
+        run: bash -n imp imp-auth
 
       # Pinned, with a checksum. The runner image's shellcheck drifts, and a
       # version that disagrees with the one on the author's machine turns CI
@@ -37,15 +37,15 @@ jobs:
           echo "${SHELLCHECK_SHA256}  shellcheck.tar.xz" | sha256sum -c -
           tar -xJf shellcheck.tar.xz
           "shellcheck-${SHELLCHECK_VERSION}/shellcheck" --version
-          "shellcheck-${SHELLCHECK_VERSION}/shellcheck" imp-auth
+          "shellcheck-${SHELLCHECK_VERSION}/shellcheck" imp imp-auth
 
       - name: py_compile
-        run: python3 -m py_compile imp
+        run: python3 -m py_compile imp-proxy
 
       - name: ruff
         run: |
           pip install --disable-pip-version-check --quiet ruff
-          ruff check --select E9,F63,F7,F82 imp tests/
+          ruff check --select E9,F63,F7,F82 imp-proxy tests/
 
   test:
     strategy:
@@ -67,11 +67,13 @@ jobs:
         run: python3 -W error::ResourceWarning -m unittest discover -s tests -v
 
       # The lint job runs bash 5. macOS still ships /bin/bash 3.2.57, which is
-      # what imp-auth actually has to parse there -- and it is the only place
-      # CI can see that. Explicitly /bin/bash: Homebrew's bash 5 is on PATH on
-      # these runners and would hide the breakage.
-      - name: /bin/bash 3.2 parses imp-auth
+      # what these actually have to parse there -- and it is the only place CI
+      # can see that. Explicitly /bin/bash: Homebrew's bash 5 is on PATH on
+      # these runners and would hide the breakage. It matters most for `imp`,
+      # which is the script you run every time, on a Mac, under 3.2.
+      - name: /bin/bash 3.2 parses the shell scripts
         if: runner.os == 'macOS'
         run: |
           /bin/bash --version | head -1
+          /bin/bash -n imp
           /bin/bash -n imp-auth

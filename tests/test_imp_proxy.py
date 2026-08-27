@@ -1,8 +1,9 @@
-"""Tests for imp.
+"""Tests for imp-proxy.
 
-The interesting claims imp makes are security claims: the sprite's capability
-is not a credential, the path allowlist holds before the real token is
-attached, and the framed tunnel is 8-bit clean. Those are what is tested here.
+The interesting claims imp-proxy makes are security claims: the sprite's
+capability is not a credential, the path allowlist holds before the real token
+is attached, and the framed tunnel is 8-bit clean. Those are what is tested
+here. `imp` itself is a launcher with nothing at stake; shellcheck covers it.
 
 Stdlib only, matching the tool itself. Run: python3 -m unittest discover tests
 """
@@ -25,17 +26,18 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def load_imp():
-    """`imp` has no .py extension, so import it by path.
+    """`imp-proxy` is not a valid identifier, so import it by path.
 
-    The stdlib had a module called `imp` until 3.12; register ours under a
-    distinct name so nothing resolves to the wrong one.
+    Bound to the name `imp` here because that is what the code under test
+    calls itself throughout -- the file is the proxy, the project is imp.
     """
     spec = importlib.util.spec_from_loader(
-        "imp_tool",
-        importlib.machinery.SourceFileLoader("imp_tool", os.path.join(ROOT, "imp")),
+        "imp_proxy",
+        importlib.machinery.SourceFileLoader(
+            "imp_proxy", os.path.join(ROOT, "imp-proxy")),
     )
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["imp_tool"] = mod
+    sys.modules["imp_proxy"] = mod
     spec.loader.exec_module(mod)
     return mod
 

@@ -9,28 +9,46 @@ without ever giving it the credential.
 imp -s my-sprite
 ```
 
-`claude` on the sprite now runs on your Max subscription. Ctrl-C revokes it
-instantly. The sprite never held anything worth stealing.
+A tmux window: a console on the sprite above, the proxy's log in a strip
+below. `claude` there now runs on your Max subscription. Ctrl-C the lower pane
+— or close the window — and access dies instantly. The sprite never held
+anything worth stealing.
+
+`imp` is only sugar for two commands you could type yourself. The one that
+matters is `imp-proxy`, which needs no tmux and is a Ctrl-C away as it always
+was:
+
+```
+imp-proxy -s my-sprite      # then `sprite console` wherever you like
+```
 
 *An imp is a small servant you lend out. It does the work, it carries nothing
 worth taking, and it goes away when you stop looking at it.*
 
 ## Install
 
-Two files, no packaging, no dependencies. Drop them somewhere on your `PATH`:
+Three files, no packaging, no dependencies. Drop them somewhere on your
+`PATH`:
 
 ```sh
 git clone https://github.com/metcalfc/imp.git
 cd imp
-install -m 755 imp imp-auth /usr/local/bin/
+install -m 755 imp imp-proxy imp-auth /usr/local/bin/
 ```
 
-Or run it straight out of the clone — `./imp -s my-sprite` works the same.
+| | |
+|---|---|
+| `imp` | opens the tmux window. Sugar; passes every option through |
+| `imp-proxy` | the whole of it — the credential, the tunnel, the allowlist |
+| `imp-auth` | mints and stores the token `imp-proxy` reads |
+
+Or run them straight out of the clone — `./imp -s my-sprite` works the same,
+and picks up the `imp-proxy` sitting next to it rather than one on your `PATH`.
 
 You need `python3` and the [`sprite` CLI](https://docs.sprites.dev) on your
-machine, `python3` on the sprite, and a Claude Max subscription. Nothing is
-installed on the sprite: the relay is shipped as base64 in argv and never
-touches its disk.
+machine, `tmux` only if you want the window, `python3` on the sprite, and a
+Claude Max subscription. Nothing is installed on the sprite: the relay is
+shipped as base64 in argv and never touches its disk.
 
 Then either log in with `claude` and go, or mint a dedicated token first —
 recommended, and explained under [Credential selection](#credential-selection):
@@ -150,7 +168,7 @@ stateDiagram-v2
     direction LR
     [*] --> Idle
 
-    Idle --> Active: imp starts
+    Idle --> Active: imp-proxy starts
 
     Active --> Idle: Ctrl-C
     Active --> Orphaned: link drops / kill -9
@@ -270,7 +288,8 @@ Every rejection carries the method and target that caused it, so a line like
 ```
 
 is legible on sight: that one is a `claude` still holding the capability from a
-previous imp session, which is expected once after a restart and suspicious if
+previous `imp-proxy` session, which is expected once after a restart and
+suspicious if
 it repeats. The target is the sprite's to choose, so it is reduced to printable
 ASCII and clipped at 120 characters before it reaches your terminal.
 
@@ -292,7 +311,7 @@ underneath it.
 Widen it with `--allow`, which takes globs and repeats:
 
 ```
-imp -s my-sprite --allow '/v1/messages/batches*'
+imp-proxy -s my-sprite --allow '/v1/messages/batches*'
 ```
 
 `--allow-any-path` turns the check off entirely. It is the wrong default and
@@ -330,7 +349,7 @@ conceded risk; wedging your laptop is not.
 
 ## Concurrent sessions
 
-Two `imp` sessions against one sprite on the same remote port already refuse
+Two `imp-proxy` sessions against one sprite on the same remote port already refuse
 each other: the second relay cannot bind, so it exits before anything is
 written. Only `-p` lets them coexist, and then they contend over one
 `settings.json`.
@@ -369,8 +388,8 @@ but it is a broader credential than the job needs.
 ## Usage
 
 ```
-imp [-s SPRITE] [-p REMOTE_PORT] [--no-settings]
-    [--allow GLOB] [--allow-any-path] [-v]
+imp-proxy [-s SPRITE] [-p REMOTE_PORT] [--no-settings]
+          [--allow GLOB] [--allow-any-path] [-v]
 
   -s, --sprite        sprite name (default: the one `sprite use` selected in
                       this directory; without either, it exits and says so)
@@ -409,12 +428,14 @@ rewriting it in place — asserted by the inode changing, which is the only
 thing that actually distinguishes the two.
 
 CI runs them on Linux and macOS against Python 3.9 through 3.13, alongside
-`shellcheck` and `bash -n` on `imp-auth`.
+`shellcheck` and `bash -n` on `imp` and `imp-auth` — the latter under macOS's
+own `/bin/bash` 3.2, which is what `imp` actually has to parse there.
 
 ## See also
 
 `imp-auth` in this repo does two jobs. `imp-auth mint` / `store` / `forget`
-manage the keychain entry that `imp` reads — that part you want, and the Install
+manage the keychain entry that `imp-proxy` reads — that part you want, and the
+Install
 section above uses it.
 
 `imp-auth push` is the earlier design: it copies the real token into the
