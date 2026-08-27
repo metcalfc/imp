@@ -70,6 +70,14 @@ PING_EVERY = 10.0
 LINK_TIMEOUT = 60.0
 RELAY_IDLE_TIMEOUT = 30.0
 
+# A hostile sprite gets to declare how much we should allocate for it. None of
+# these are tuning knobs -- they exist so that a number chosen on the far end
+# cannot exhaust memory, threads or descriptors on this machine.
+MAX_BODY = 64 * 1024 * 1024     # generous next to a large image request
+MAX_FRAME = 1024 * 1024         # the relay never sends more than 64KB
+MAX_STREAMS = 256               # concurrent proxied connections
+SETTINGS_TIMEOUT = 30.0         # ssh round trip for settings.json
+
 
 def log(*a):
     sys.stderr.write("[imp] " + " ".join(str(x) for x in a) + "\n")
@@ -264,6 +272,23 @@ HOP = {"host", "accept-encoding", "content-length", "connection", "keep-alive",
        "transfer-encoding", "upgrade"}
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow redirects.
+
+    urllib's default handler copies Authorization into the redirected request
+    without checking the origin, so a 3xx would hand the real token to
+    whatever host the Location names. Returning None leaves the 3xx to
+    surface as an HTTPError, which we pass back to the sprite verbatim --
+    it can decide what to do with it, without our credential.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _close(resp):
     """Release an upstream response -- an HTTPError body holds a socket too."""
     try:
@@ -308,6 +333,11 @@ def make_proxy_handler(cred, capability, verbose, allowed):
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            # We may be refusing before reading the request body, so this
+            # connection cannot be reused -- whatever is still in flight would
+            # be parsed as the next request line.
+            self.send_header("Connection", "close")
+            self.close_connection = True
             self.end_headers()
             self.wfile.write(body)
 
@@ -325,11 +355,6 @@ def make_proxy_handler(cred, capability, verbose, allowed):
             if len(q) == 2:
                 target += "?" + q[1]
 
-            body = b""
-            n = self.headers.get("Content-Length")
-            if n:
-                body = self.rfile.read(int(n))
-
             fwd = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
             fwd["Accept-Encoding"] = "identity"
 
@@ -343,9 +368,29 @@ def make_proxy_handler(cred, capability, verbose, allowed):
                     presented = presented or v
             presented = presented[7:] if presented.lower().startswith("bearer ") else presented
 
+            # Before the body is read, not after: Content-Length is chosen by
+            # the sprite, and reading it first hands an unauthenticated caller
+            # a blocking allocation of whatever size it likes.
             if not presented or presented.strip() != capability:
                 self._reject(403, "bad or missing session capability")
                 return
+
+            n = self.headers.get("Content-Length")
+            try:
+                length = int(n) if n else 0
+            except ValueError:
+                self._reject(400, "malformed Content-Length")
+                return
+            if length < 0:
+                # rfile.read(-1) would read to EOF -- unbounded, by way of a
+                # value that merely looks like a number.
+                self._reject(400, "negative Content-Length")
+                return
+            if length > MAX_BODY:
+                self._reject(413, "request body of %d bytes exceeds the %d byte limit"
+                             % (length, MAX_BODY))
+                return
+            body = self.rfile.read(length) if length else b""
 
             fwd["Authorization"] = "Bearer " + cred.token
             betas = [b for b in (fwd.get("anthropic-beta") or "").split(",") if b]
@@ -362,7 +407,7 @@ def make_proxy_handler(cred, capability, verbose, allowed):
                 req = urllib.request.Request(UPSTREAM + target, data=body or None,
                                              headers=fwd, method=self.command)
                 try:
-                    r = urllib.request.urlopen(req, timeout=600)
+                    r = OPENER.open(req, timeout=600)
                     return r, r.getcode(), None
                 except urllib.error.HTTPError as e:
                     return e, e.code, None
@@ -601,6 +646,18 @@ class Mux(object):
                 pass
 
     def _open(self, sid):
+        with self.lock:
+            if len(self.socks) >= MAX_STREAMS:
+                log("refusing stream %d: %d already open" % (sid, MAX_STREAMS))
+                self.send(sid, T_CLOSE)
+                return
+            stale = self.socks.pop(sid, None)
+        if stale is not None:
+            # A repeated SID used to overwrite the entry and leak the socket.
+            try:
+                stale.close()
+            except OSError:
+                pass
         try:
             conn = socket.create_connection(("127.0.0.1", self.proxy_port), timeout=10)
             conn.settimeout(None)
@@ -618,13 +675,16 @@ class Mux(object):
             self.send(0, T_PING)
 
     def _readexact(self, n):
-        buf = b""
-        while len(buf) < n:
-            c = self.proc.stdout.read(n - len(buf))
+        # Chunks into a list rather than repeatedly concatenating: `buf += c`
+        # over a large frame is quadratic.
+        parts, got = [], 0
+        while got < n:
+            c = self.proc.stdout.read(n - got)
             if not c:
                 return None
-            buf += c
-        return buf
+            parts.append(c)
+            got += len(c)
+        return b"".join(parts)
 
     def run(self):
         threading.Thread(target=self.pinger, daemon=True).start()
@@ -633,6 +693,13 @@ class Mux(object):
             if h is None:
                 break
             sid, t, ln = HDR.unpack(h)
+            if ln > MAX_FRAME:
+                # The length is a uint32 chosen by the far end. Allocating on
+                # its say-so is how the sprite OOMs this machine; the relay
+                # never legitimately sends more than 64KB.
+                log("frame of %d bytes exceeds the %d byte limit -- "
+                    "closing the link" % (ln, MAX_FRAME))
+                break
             payload = self._readexact(ln) if ln else b""
             if payload is None:
                 break
@@ -757,8 +824,14 @@ def remote_python(src, args=()):
 def write_sprite_settings(sprite, base_url, capability):
     """Install (or clear) the sprite's pointer at us. Neither value is a secret."""
     argv = ssh_argv(sprite, remote_python(SETTINGS_SCRIPT))
-    r = subprocess.run(argv, input="%s\n%s\n" % (base_url, capability),
-                       capture_output=True, text=True)
+    try:
+        r = subprocess.run(argv, input="%s\n%s\n" % (base_url, capability),
+                           capture_output=True, text=True,
+                           timeout=SETTINGS_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        # The sprite controls when this command finishes and how much it
+        # prints. Teardown must not be something it can hold open.
+        return False, "timed out after %.0fs" % SETTINGS_TIMEOUT
     if r.returncode != 0:
         return False, (r.stderr.strip() or "ssh failed")
     return True, r.stdout.strip()

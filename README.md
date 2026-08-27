@@ -286,6 +286,23 @@ imp -s my-sprite --allow '/v1/messages/batches*'
 `--allow-any-path` turns the check off entirely. It is the wrong default and
 the log says so at startup.
 
+## Limits
+
+The sprite chooses the numbers in its own requests, so none of them may turn
+into an unbounded allocation here. A hostile sprite spending your quota is a
+conceded risk; wedging your laptop is not.
+
+| Bound | Default | Why |
+|---|---|---|
+| request body | 64 MB | `Content-Length` is the sprite's to declare. Checked **after** the capability, so an unauthenticated caller never causes an allocation at all — and a negative or non-numeric value is refused rather than read to EOF |
+| tunnel frame | 1 MB | the frame length is a `uint32` from the sprite's stdout; the relay never legitimately sends more than 64 KB |
+| concurrent streams | 256 | each `OPEN` costs a socket and a thread on your machine; a repeated stream id closes the socket it replaces rather than leaking it |
+| settings.json ssh | 30 s | the sprite decides when that command finishes and how much it prints — teardown must not be something it can hold open |
+
+Redirects are never followed. `urllib`'s default handler copies `Authorization`
+into a redirected request without checking the origin, so a `3xx` is passed
+back to the sprite verbatim rather than chased with your credential attached.
+
 ## Credential selection
 
 Checked in order, first hit wins. Nothing is ever written back.

@@ -9,6 +9,7 @@ Stdlib only, matching the tool itself. Run: python3 -m unittest discover tests
 
 import base64
 import importlib.util
+import io
 import json
 import os
 import socket
@@ -314,8 +315,10 @@ class ProxyTestCase(unittest.TestCase):
         hdrs = {"Host": "api.anthropic.com", "Content-Type": "application/json"}
         if auth is not False:
             hdrs["Authorization"] = auth
-        hdrs.update(headers or {})
+        # Default to the true length, but let a test declare a lying one --
+        # that is exactly the input the bounds are there to survive.
         hdrs["Content-Length"] = str(len(body))
+        hdrs.update(headers or {})
 
         raw = ("%s %s HTTP/1.1\r\n" % (method, path)).encode()
         raw += b"".join(("%s: %s\r\n" % (k, v)).encode() for k, v in hdrs.items())
@@ -507,6 +510,89 @@ class TestCredentialRefresh(ProxyTestCase):
         self.assertEqual(len(self.upstream.requests), 1, "must not retry blindly")
 
 
+class TestResourceBounds(ProxyTestCase):
+    """A hostile sprite declares the numbers here; none of them may turn into
+    an unbounded allocation on this machine."""
+
+    def test_oversized_content_length_is_refused(self):
+        self.start()
+        # Declared, not sent -- the point is that we never allocate for it.
+        status, _, _ = self.request(
+            body=b"x", headers={"Content-Length": str(imp.MAX_BODY + 1)})
+        self.assertEqual(status, 413)
+        self.assertEqual(self.upstream.requests, [])
+
+    def test_negative_content_length_is_refused(self):
+        # int("-1") parses fine and rfile.read(-1) reads to EOF.
+        self.start()
+        status, _, _ = self.request(body=b"", headers={"Content-Length": "-1"})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.upstream.requests, [])
+
+    def test_malformed_content_length_is_refused(self):
+        self.start()
+        status, _, _ = self.request(body=b"", headers={"Content-Length": "abc"})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.upstream.requests, [])
+
+    def test_body_is_not_read_before_the_capability_check(self):
+        """A bad capability must be refused without allocating for the body."""
+        self.start()
+        status, _, _ = self.request(
+            auth="Bearer wrong",
+            body=b"x", headers={"Content-Length": str(imp.MAX_BODY + 1)})
+        # 403 (capability), not 413 (size) -- proving auth ran first.
+        self.assertEqual(status, 403)
+        self.assertEqual(self.upstream.requests, [])
+
+    def test_a_large_but_legal_body_still_goes_through(self):
+        self.start()
+        payload = b'{"m":"' + b"z" * (2 * 1024 * 1024) + b'"}'
+        status, _, _ = self.request(body=payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.upstream.requests[0][3], payload)
+
+
+class TestNoRedirect(ProxyTestCase):
+    def test_a_redirect_is_passed_back_and_not_followed(self):
+        """urllib's default handler copies Authorization across origins."""
+        followed = []
+
+        class Redirector(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(n)
+                if self.path.startswith("/v1/messages"):
+                    self.send_response(302)
+                    self.send_header("Location", "/elsewhere")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                else:
+                    followed.append(dict(self.headers))
+                    self.send_response(200)
+                    self.send_header("Content-Length", "2")
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+
+        srv = HTTPServer(("127.0.0.1", 0), Redirector)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        imp.UPSTREAM = "http://127.0.0.1:%d" % srv.server_address[1]
+        try:
+            self.start()
+            status, _, _ = self.request()
+            self.assertEqual(status, 302)
+            self.assertEqual(followed, [],
+                             "the redirect must not be followed with the token")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
 class TestStreaming(ProxyTestCase):
     def test_sse_chunks_arrive(self):
         self.upstream.sse = [b"event: message_start\n\n",
@@ -652,6 +738,80 @@ class TestRelay(unittest.TestCase):
         conn.settimeout(5)
         self.assertEqual(conn.recv(65536), b"", "relay should have closed it")
         conn.close()
+
+
+class TestMuxFrameBounds(unittest.TestCase):
+    """The frame length is a uint32 the sprite chooses."""
+
+    def test_limit_is_far_above_what_the_relay_sends(self):
+        # The relay reads in 64KB chunks, so the cap only ever bites on a
+        # length nobody legitimate would declare.
+        self.assertGreater(imp.MAX_FRAME, 65536)
+
+    def test_oversized_frame_closes_the_link_without_allocating(self):
+        class FakeProc(object):
+            """stdout declares a 4GB frame and then stops talking."""
+
+            def __init__(self):
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO(imp.HDR.pack(1, imp.T_DATA, 0xFFFFFFFF))
+                self.reads = 0
+
+            def poll(self):
+                return None
+
+        proc = FakeProc()
+        mux = imp.Mux(proc, 1, False)
+        mux.run()          # must return, not try to read 4GB
+        self.assertFalse(mux.alive)
+        self.assertEqual(mux.socks, {})
+
+
+class TestMuxStreamBounds(unittest.TestCase):
+    """Each OPEN frame costs a socket and a thread on this machine."""
+
+    class FakeProc(object):
+        def __init__(self):
+            self.stdin = io.BytesIO()
+            self.stdout = io.BytesIO(b"")
+
+        def poll(self):
+            return None
+
+    def frames_sent(self, proc):
+        raw, out = proc.stdin.getvalue(), []
+        i = 0
+        while i + imp.HDR.size <= len(raw):
+            sid, t, ln = imp.HDR.unpack(raw[i:i + imp.HDR.size])
+            out.append((sid, t))
+            i += imp.HDR.size + ln
+        return out
+
+    def test_open_beyond_the_cap_is_refused(self):
+        proc = self.FakeProc()
+        mux = imp.Mux(proc, 1, False)
+        # Port 1 is not listening, so a stream that got past the cap would
+        # fail to connect -- but the cap should refuse it before that.
+        mux.socks = {i: None for i in range(imp.MAX_STREAMS)}
+        mux._open(9999)
+        self.assertNotIn(9999, mux.socks)
+        self.assertIn((9999, imp.T_CLOSE), self.frames_sent(proc))
+
+    def test_duplicate_sid_closes_the_socket_it_replaces(self):
+        proc = self.FakeProc()
+        mux = imp.Mux(proc, 1, False)
+        a, b = socket.socketpair()
+        try:
+            mux.socks = {7: a}
+            mux._open(7)          # connect to port 1 fails, but `a` must close
+            with self.assertRaises(OSError):
+                a.send(b"x")
+        finally:
+            for sk in (a, b):
+                try:
+                    sk.close()
+                except OSError:
+                    pass
 
 
 class TestRelayWatchdog(unittest.TestCase):
