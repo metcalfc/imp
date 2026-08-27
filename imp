@@ -112,8 +112,12 @@ else
 fi
 
 # -d keeps the cursor in the console; the proxy is there to be read, not typed
-# into. Eight lines is its whole startup banner with nothing scrolled off.
-pane=$(tmux split-window -v -l 8 -d -t "$win" -P -F '#{pane_id}' "$cmd")
+# into. Three lines rather than the eight its startup banner wants: the banner
+# is read once, and the console pays those five lines for the rest of the
+# session. What you actually watch this pane for -- `rejected:`, an upstream
+# 401 -- scrolls past fine in three, and `ready` is the banner's second-to-last
+# line, so it still lands in view.
+pane=$(tmux split-window -v -l 3 -d -t "$win" -P -F '#{pane_id}' "$cmd")
 
 # `failed`, not `on`. Ctrl-C is imp-proxy's clean exit -- it tears down and
 # returns 0 -- so the pane closes with it and you are left with the console,
