@@ -532,7 +532,8 @@ class TestEndingASession(TmuxCase):
     def test_the_proxy_exiting_leaves_the_consoles_running(self):
         # Ctrl-C in the proxy window is a clean exit: revoke, keep working.
         why = self.h.revoke_proxy()
-        self.assertEqual(why, "", why)
+        if why:
+            self.fail(why)
         self.assertEqual(self.h.windows(), ["claude:foo"] * 3)
 
 
@@ -546,8 +547,20 @@ class TestReattach(TmuxCase):
     """
 
     def revoke(self):
-        why = self.h.revoke_proxy()
-        self.assertEqual(why, "", why)
+        """Leave the session without a proxy window.
+
+        Killed rather than Ctrl-C'd. What these tests are about is what
+        --reattach does with a session that has lost its proxy, and reaching
+        that state through a keystroke made seven of them depend on the
+        timing of one -- see TestEndingASession, where the keystroke is the
+        subject and belongs. Killing the window is the same loss from the
+        session's side, and it exercises the reaper on the way: the hook
+        fires, counts three consoles, and leaves them alone.
+        """
+        self.h.tmux("kill-window", "-t", self.h.proxy_window())
+        self.assertTrue(self.h.wait(lambda: "imp:foo" not in self.h.windows()),
+                        "the proxy window survived kill-window: %r"
+                        % (self.h.windows(),))
 
     def setUp(self):
         TmuxCase.setUp(self)
