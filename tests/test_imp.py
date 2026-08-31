@@ -145,6 +145,20 @@ class Harness(object):
     def consoles(self, label="foo", session="imp-foo"):
         return self.window_ids("claude:" + label, session)
 
+    def console_panes(self, label="foo", session="imp-foo"):
+        """Console panes in session order -- which reads the same tiled or
+        not, and is how "the same three consoles, still in order" is said."""
+        r = self.tmux("list-panes", "-s", "-t", session, "-F",
+                      "#{pane_id}\t#{window_name}")
+        if r.returncode != 0:
+            return []
+        return [l.split("\t")[0] for l in r.stdout.splitlines()
+                if l.endswith("\tclaude:" + label)]
+
+    def panes(self, target):
+        r = self.tmux("list-panes", "-t", target, "-F", "#{pane_id}")
+        return r.stdout.split() if r.returncode == 0 else []
+
     def proxy_window(self, label="foo", session="imp-foo"):
         ids = self.window_ids("imp:" + label, session)
         return ids[0] if ids else None
@@ -554,6 +568,82 @@ class TestReattach(TmuxCase):
         self.assertEqual(self.h.windows("imp-bar"), [])
 
 
+class TestTiling(TmuxCase):
+    """Ctrl-B T: three windows to watch one console in, one window to watch
+    all three. The binding hands `imp --tile` the window the key was pressed
+    in, so that is what these call.
+    """
+
+    def setUp(self):
+        TmuxCase.setUp(self)
+        self.h.imp("-s", "foo")
+        self.assertTrue(self.h.wait(lambda: len(self.h.windows()) == 4))
+        self.before = self.h.console_panes()
+        self.assertEqual(len(self.before), 3)
+
+    def tile(self, window=None):
+        r = self.h.imp("--tile", window or self.h.consoles()[0])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
+    def test_the_consoles_become_one_tiled_window(self):
+        self.tile()
+        self.assertEqual(self.h.windows(), ["imp:foo", "claude:foo"])
+        self.assertEqual(len(self.h.panes("imp-foo:1")), 3)
+
+    def test_the_proxy_is_not_one_of_the_panes(self):
+        # It owns the reaper hook, and Ctrl-C in it means revoke. Neither
+        # belongs in a window full of claudes.
+        proxy = self.h.proxy_window()
+        self.tile()
+        self.assertEqual(self.h.proxy_window(), proxy)
+        self.assertEqual(len(self.h.panes(proxy)), 1)
+
+    def test_the_consoles_are_the_same_ones_in_the_same_order(self):
+        self.tile()
+        self.assertEqual(self.h.console_panes(), self.before)
+
+    def test_it_toggles_back_to_a_window_each(self):
+        self.tile()
+        self.tile()
+        self.assertEqual(self.h.windows(),
+                         ["imp:foo", "claude:foo", "claude:foo", "claude:foo"])
+        self.assertEqual(self.h.console_panes(), self.before)
+        for wid in self.h.consoles():
+            self.assertEqual(len(self.h.panes(wid)), 1)
+
+    def test_pressing_it_in_the_proxy_window_tiles_the_consoles(self):
+        # The label comes off a window name, and `imp:foo` carries it too.
+        self.tile(self.h.proxy_window())
+        self.assertEqual(self.h.windows(), ["imp:foo", "claude:foo"])
+
+    def test_tiling_does_not_look_like_the_last_console_closing(self):
+        # Three windows are unlinked on the way in, and the reaper watches
+        # exactly that. It counts by name, and the merged window still has
+        # the name -- so the proxy stays.
+        self.tile()
+        time.sleep(0.8)
+        self.assertIsNotNone(self.h.proxy_window())
+        self.assertIn("PROXY UP", self.h.pane_text(self.h.proxy_window()))
+
+    def test_closing_the_tiled_window_still_takes_the_proxy_down(self):
+        self.tile()
+        self.h.tmux("kill-window", "-t", "imp-foo:1")
+        self.assertTrue(self.h.wait(lambda: self.h.windows() == []),
+                        "session outlived its consoles: %r"
+                        % (self.h.windows(),))
+
+    def test_a_session_with_no_consoles_is_left_alone(self):
+        self.h.tmux("new-session", "-d", "-s", "plain", "-n", "shell",
+                    "sleep 300")
+        wid = self.h.tmux("display", "-p", "-t", "plain",
+                          "#{window_id}").stdout.strip()
+        r = self.h.imp("--tile", wid)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(self.h.windows("plain"), ["shell"])
+        self.assertEqual(len(self.h.windows()), 4)
+
+
 class TestKeyBindings(TmuxCase):
     def test_it_binds_a_key_that_skips_the_proxy_window(self):
         self.h.imp("-s", "foo")
@@ -562,6 +652,15 @@ class TestKeyBindings(TmuxCase):
         self.assertIn("C-n", keys)
         self.assertIn("C-p", keys)
         self.assertIn("imp:*", keys)
+
+    def test_it_binds_a_key_for_the_tiled_view(self):
+        self.h.imp("-s", "foo")
+        self.assertTrue(self.h.wait(lambda: len(self.h.windows()) == 4))
+        keys = self.h.tmux("list-keys", "-T", "prefix").stdout
+        self.assertIn("--tile", keys)
+        # The window the key was pressed in, expanded by tmux rather than
+        # guessed by the script.
+        self.assertIn("#{window_id}", keys)
 
     def test_stepping_never_lands_on_the_proxy(self):
         """The bound command chain, exercised directly.

@@ -26,6 +26,14 @@ what the proxy spends the first second or two writing.
 |---|---|
 | `Ctrl-B n` | next window, the proxy included |
 | `Ctrl-B C-n` | next **claude** window, stepping over the proxy (`C-p` back) |
+| `Ctrl-B T` | every claude in one tiled window — press it again for a window each |
+
+A window each is the right shape for working in one console and the wrong one
+for watching three. `Ctrl-B T` joins them into a single tiled window and takes
+them back out again, in the same order, and `Ctrl-B z` zooms one of them while
+they are together — that part is tmux's own. The proxy keeps its own window
+through both: it is what Ctrl-C revokes from, and what notices when the last
+console closes.
 
 Ctrl-C the proxy window and access dies instantly — the window goes with it,
 leaving the consoles you were working in, now unfunded. Closing the last

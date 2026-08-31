@@ -21,6 +21,8 @@
 #
 # Ctrl-B n walks all four. Ctrl-B C-n walks only the claude windows, which is
 # the one you want when you are actually working; Ctrl-B C-p goes back.
+# Ctrl-B T puts every claude in one tiled window, to watch all three at once,
+# and puts them back.
 #
 # Everything of consequence stays in imp-proxy: the credential, the path
 # allowlist, the capability. This script never touches any of them. It does
@@ -42,6 +44,20 @@ set -euo pipefail
 
 die() { printf 'imp: %s\n' "$*" >&2; exit 1; }
 
+# The label out of a list of window names on stdin -- `claude:foo` or
+# `imp:foo` means the session belongs to an imp session called foo.
+#
+# All of the input is read, and the first match is held until there is no
+# more. `... | head -n 1` is the obvious way to write that and is wrong here
+# for the reason the reaper gives: head exits at the first line, whatever is
+# upstream dies of SIGPIPE, and under `set -o pipefail` the assignment that
+# wraps the pipeline fails -- so `set -e` ends the script, sometimes, when
+# the writer happened to still be writing.
+first_label() {
+  awk -F: '($1 == "claude" || $1 == "imp") && !seen++ { label = $2 }
+           END { if (label != "") print label }'
+}
+
 usage() {
   cat >&2 <<'USAGE'
 usage: imp [-s NAME | -H HOST] [-n COUNT] [--reattach] [imp-proxy options...]
@@ -53,6 +69,7 @@ imp-proxy untouched -- see `imp-proxy --help`.
 
   Ctrl-B n      next window, including the proxy
   Ctrl-B C-n    next claude window, skipping the proxy  (C-p for previous)
+  Ctrl-B T      every claude in one tiled window, and back to a window each
 
 `claude` is started in each console once the proxy reports ready, not before:
 it reads settings.json at startup, and settings.json is what imp-proxy is
@@ -102,6 +119,93 @@ EOF
     # created this also empties it, and tmux ends the session for us.
     tmux set-hook -u -t "$reap_win" window-unlinked 2>/dev/null || true
     tmux kill-window -t "$reap_win" 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+# Hidden too, and called by the Ctrl-B T binding with the window the key was
+# pressed in -- tmux expands #{window_id} in a run-shell command, so nothing
+# here has to guess which session is being asked about. A window id and not a
+# session id, for the reason the reaper gives.
+#
+# Three consoles are three windows, which is the right shape for working in
+# one of them and the wrong one for watching all three at once. So this
+# toggles: every console pane into a single tiled window, and back out to a
+# window each. Ctrl-B z then zooms one of them, which is tmux's own job.
+#
+# The proxy is left where it is, in both directions. It owns the reaper hook
+# and Ctrl-C in it means revoke; neither wants to be a pane in a window full
+# of claudes. That it stays a window is also what keeps the reaper right
+# while tiled -- the merged window is still named `claude:LABEL`, so the
+# console count is 1 and not 0, and the last console closing still takes the
+# proxy with it.
+if [ "${1:-}" = --tile ]; then
+  [ $# -eq 2 ] || exit 0
+  tile_win=$2
+  tile_session=$(tmux display-message -p -t "$tile_win" '#{session_name}' \
+                 2>/dev/null || true)
+  [ -n "$tile_session" ] || exit 0
+
+  # The label off a window name rather than off the session name: run inside
+  # an existing tmux, imp puts its windows in a session somebody else named.
+  tile_name=$(tmux display-message -p -t "$tile_win" '#{window_name}' \
+              2>/dev/null || true)
+  case "$tile_name" in
+    claude:*|imp:*) tile_label=${tile_name#*:} ;;
+    *) tile_label=$(tmux list-windows -t "=$tile_session" -F '#{window_name}' \
+                    2>/dev/null | first_label) || tile_label="" ;;
+  esac
+  [ -n "$tile_label" ] || exit 0
+
+  # The console panes, in window order, which is the order they keep.
+  tile_panes=$(tmux list-panes -s -t "=$tile_session" \
+               -F '#{window_id} #{pane_id} #{window_name}' 2>/dev/null \
+               | awk -v want="claude:$tile_label" '$3 == want { print $1" "$2 }')
+  [ -n "$tile_panes" ] || exit 0
+  tile_host=$(printf '%s\n' "$tile_panes" | awk 'NR == 1 { print $1 }')
+  tile_count=$(printf '%s\n' "$tile_panes" \
+               | awk '{ if (!($1 in seen)) { seen[$1] = 1; n++ } } END { print n+0 }')
+  tile_active=$(tmux display-message -p -t "$tile_win" '#{pane_id}' \
+                2>/dev/null || true)
+
+  if [ "$tile_count" -gt 1 ]; then
+    # Each pane joins onto the one joined before it. Joining them all onto
+    # the host would reverse them -- a joined pane lands beside the target,
+    # and the target would not move. And a layout after every join rather
+    # than one at the end: a window with no room left refuses the next pane
+    # instead of making room for it.
+    tile_after=$(printf '%s\n' "$tile_panes" | awk 'NR == 1 { print $2 }')
+    for tile_p in $(printf '%s\n' "$tile_panes" \
+                    | awk -v host="$tile_host" '$1 != host { print $2 }'); do
+      tmux join-pane -d -s "$tile_p" -t "$tile_after" 2>/dev/null || continue
+      tile_after=$tile_p
+      tmux select-layout -t "$tile_host" tiled 2>/dev/null || true
+    done
+    tmux select-layout -t "$tile_host" tiled 2>/dev/null || true
+    tmux select-window -t "$tile_host" 2>/dev/null || true
+    [ -z "$tile_active" ] || tmux select-pane -t "$tile_active" 2>/dev/null || true
+  else
+    # Back out: every pane but the first becomes a window again, each one
+    # after the last, so they return in the order they were tiled in. Named
+    # on the way out because the reaper counts consoles by name -- a window
+    # called `sh` is not one, and three of them would leave the proxy funding
+    # what it thinks is nothing. -a wants tmux 3.2; without it they land at
+    # the end of the session, in order, which reads very slightly wrong.
+    tile_prev=$tile_host
+    tile_first=1
+    for tile_p in $(printf '%s\n' "$tile_panes" | awk '{ print $2 }'); do
+      if [ "$tile_first" = 1 ]; then tile_first=0; continue; fi
+      tile_new=$(tmux break-pane -d -a -s "$tile_p" -t "$tile_prev" \
+                 -n "claude:$tile_label" -P -F '#{window_id}' 2>/dev/null) \
+        || tile_new=""
+      [ -n "$tile_new" ] \
+        || tile_new=$(tmux break-pane -d -s "$tile_p" -n "claude:$tile_label" \
+                      -P -F '#{window_id}' 2>/dev/null) || tile_new=""
+      [ -n "$tile_new" ] || continue
+      tmux set-option -w -t "$tile_new" automatic-rename off 2>/dev/null || true
+      tile_prev=$tile_new
+    done
+    [ -z "$tile_active" ] || tmux select-window -t "$tile_active" 2>/dev/null || true
   fi
   exit 0
 fi
@@ -193,6 +297,16 @@ bind_step_keys() {
   done
 }
 
+# Ctrl-B T: the consoles as one tiled window, and back again. T because it is
+# unbound in tmux's defaults -- `t` is the clock, and taking that away from
+# every session on the server to save a Shift is a poor trade. Harmless
+# elsewhere for the same reason the step keys are: in a session with no
+# `claude:` windows the script finds no label and does nothing at all.
+bind_tile_key() {
+  tmux bind-key -T prefix T \
+    "run-shell -b '\"$here/imp\" --tile #{window_id}'" 2>/dev/null || true
+}
+
 # When the last console closes, take the proxy down with it. Ctrl-C in the
 # proxy window is the other direction and must not trigger this, which is why
 # the reaper counts `claude:` windows rather than watching any single pane.
@@ -266,6 +380,7 @@ EOF
     fi
     proxy_pane_options "$win"
     bind_step_keys
+    bind_tile_key
     arm_reaper "$win"
   fi
 
@@ -326,6 +441,7 @@ tmux select-window -t "$win" 2>/dev/null || true
 tmux select-window -t :+ 2>/dev/null || true
 
 bind_step_keys
+bind_tile_key
 arm_reaper "$win"
 
 # `claude` last, and only once the proxy says the far side is funded: it reads
