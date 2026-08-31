@@ -1658,6 +1658,16 @@ class TestSessionState(unittest.TestCase):
         self.assertEqual(got, cap)
         self.assertEqual(why, "")
 
+    def test_it_records_how_the_target_is_reached(self):
+        # `imp --meter` has only the label, and a sprite is not sampled the
+        # way an ssh host is.
+        imp.save_capability(self.target, 8080, imp.new_capability())
+        imp.save_capability(imp.SSHTarget("box"), 8080, imp.new_capability())
+        with open(imp.state_path(self.target, 8080)) as f:
+            self.assertEqual(json.load(f)["kind"], "sprite")
+        with open(imp.state_path(imp.SSHTarget("box"), 8080)) as f:
+            self.assertEqual(json.load(f)["kind"], "ssh")
+
     def test_a_port_is_part_of_which_session_this_is(self):
         # Two proxies against one host on two ports fund two sets of
         # consoles; handing one's capability back to the other funds neither.

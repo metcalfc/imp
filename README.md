@@ -467,6 +467,53 @@ A stream that buffers past 8 MB without draining is dropped on its own; a
 `claude` that pauses to render a long response is slow, not stuck, and 8 MB is
 a long way past slow.
 
+## How busy is it
+
+Three consoles on one sprite is three test suites on one set of cores, and
+when everything is slow the first question is which machine is busy. Usually
+not this one — so `imp --meter` is a status-line segment that says:
+
+```
+spr  58% mac  11%        one suite running
+spr x2.4 mac  11%        three of them, on eight cores
+```
+
+`spr` is the sprite the session's consoles are on and `mac` is the machine the
+bar is drawn on. `x2.4` is the sprite's run queue over its core count, shown
+once it passes 1.25 — and shown *instead of* the percentage, which by then has
+nothing left to say: three test suites peg a box at 100% and so does one.
+
+Both fields are four characters wide in every state, including `~58%` for a
+reading that has gone stale and `..%` for one that has not arrived. A status
+line is read out of the corner of an eye, and a column that shifts whenever a
+number does is a column that gets read properly every time. Wire it into
+`status-right`:
+
+```tmux
+set -g status-right "#(imp --meter #{session_name}) %H:%M"
+set -g status-right-length 60
+```
+
+tmux expands `#{session_name}` before running the command, so the segment
+knows which session it is drawing for; a session that is not one of imp's has
+no far side and gets the local number alone.
+
+Nothing in the status line waits on the network. The far side's figure comes
+out of a file that a detached sample refreshes at most every 20 seconds, and
+the segment only ever reads it — a status job that blocks on ssh blocks every
+redraw behind it. Sampling also stops when you stop watching: tmux runs a
+status job only for an attached client, so a detached session polls nothing
+and leaves the sprite to fall idle rather than poking it awake all afternoon.
+
+| | |
+|---|---|
+| `IMP_METER_INTERVAL` | seconds between samples of the far side (default 20) |
+| `IMP_METER_STYLE` | a tmux style for the segment, e.g. `#[fg=#6e738d]` |
+| `IMP_METER_HOT` | a style for the sprite's figure once it is over the threshold |
+| `IMP_METER_HOT_AT` | that threshold, as a percentage (default 85) |
+
+Set them where the tmux server will see them, which is `set-environment -g`.
+
 ## Limits
 
 The sprite chooses the numbers in its own requests, so none of them may turn

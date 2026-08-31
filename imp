@@ -210,6 +210,193 @@ if [ "${1:-}" = --tile ]; then
   exit 0
 fi
 
+# Hidden, and called from the tmux status line rather than by a person:
+#
+#     set -g status-right "#(imp --meter #{session_name}) %H:%M"
+#
+# tmux expands #{session_name} before running the command, so this is told
+# which session it is drawing for and never has to guess.
+#
+# Two numbers, because when three test suites are slow the question is which
+# machine is busy, and the answer is usually not this one: `spr` is the far
+# side, `mac` is here. The far side's is the whole point -- consoles are
+# where the work runs -- and it is the one that costs something to ask for,
+# so it is never asked for inline. A detached refresh writes a file; this
+# only ever reads it. A status job must not block, and a status job that
+# waits on ssh blocks every redraw behind it.
+#
+# Sampling stops when you stop looking: tmux runs a status job only for an
+# attached client, so a detached session polls nothing and a sprite nobody is
+# watching is left to fall idle rather than poked awake every twenty seconds.
+if [ "${1:-}" = --meter ]; then
+  [ $# -eq 2 ] || exit 0
+  meter_session=$2
+  meter_dir="${XDG_STATE_HOME:-$HOME/.local/state}/imp"
+  meter_style=${IMP_METER_STYLE:-}
+  meter_hot=${IMP_METER_HOT:-}
+  meter_hot_at=${IMP_METER_HOT_AT:-85}
+  meter_every=${IMP_METER_INTERVAL:-20}
+
+  # A sample is two /proc/stat lines, and from the far side a load average
+  # and a core count after them. The first two become one number: everything
+  # that was not idle or waiting on IO between them, as a percentage. A
+  # single snapshot of /proc/stat is uptime, not load.
+  #
+  # Then the number a percentage cannot give you. Three test suites on an
+  # eight-core box peg the CPU at 100%, and so does one; what tells them
+  # apart is the run queue. So a load past 1.25 cores is reported too, and
+  # takes the percentage's place in the bar -- see below, where they share
+  # one four-character field because at that point the percentage has
+  # nothing left to say.
+  # shellcheck disable=SC2016  # an awk program, not a shell string
+  meter_awk='
+    NR == 1 { for (i = 2; i <= NF; i++) a[i] = $i; na = NF }
+    NR == 2 { for (i = 2; i <= NF; i++) b[i] = $i; nb = NF }
+    NR == 3 { load = $1 + 0 }
+    NR == 4 { cores = $1 + 0 }
+    END {
+      if (na < 6 || nb < 6) exit
+      for (i = 2; i <= na; i++) ta += a[i]
+      for (i = 2; i <= nb; i++) tb += b[i]
+      d = tb - ta
+      if (d <= 0) exit
+      p = 100 * (d - ((b[5] + b[6]) - (a[5] + a[6]))) / d
+      if (p < 0) p = 0
+      if (p > 100) p = 100
+      printf "%d", p + 0.5
+      if (cores > 0 && load / cores >= 1.25) {
+        r = load / cores
+        if (r > 99) r = 99
+        # A tenth is worth having at x2.4 and is noise at x12; either way it
+        # is three characters, because the column it sits in is four wide.
+        if (r >= 10) printf " %d", r + 0.5
+        else printf " %.1f", r
+      }
+      printf "\n"
+    }'
+
+  # The label off a window name, the way --tile finds it: a session that is
+  # not one of imp's has no far side to ask about, and gets the local number
+  # on its own.
+  # A session that ended between the redraw and this job is a session with
+  # no far side to report on, not an error: tmux fails, pipefail makes the
+  # assignment fail with it, and set -e would take the whole segment out --
+  # including the local number, which is still perfectly knowable.
+  meter_label=$(tmux list-windows -t "=$meter_session" -F '#{window_name}' \
+                2>/dev/null | first_label) || meter_label=""
+
+  meter_text=""
+  if [ -n "$meter_label" ]; then
+    meter_file="$meter_dir/meter-$meter_label"
+    meter_at=0; meter_pct=""; meter_over=""
+    if [ -r "$meter_file" ]; then
+      read -r meter_at meter_pct meter_over < "$meter_file" || true
+    fi
+    case "$meter_at" in ""|*[!0-9]*) meter_at=0 ;; esac
+    case "$meter_pct" in ""|*[!0-9]*) meter_pct="" ;; esac
+    case "$meter_over" in ""|*[!0-9.]*) meter_over="" ;; esac
+    [ -z "$meter_over" ] || meter_over="x$meter_over"
+    # Four characters wide whatever the file says: past x9.9 the tenth goes,
+    # and anything still too wide is cut. The sampler already rounds to fit,
+    # so this is only reached by a cache somebody has edited -- but a column
+    # that holds except in one case is a column that does not hold.
+    if [ "${#meter_over}" -gt 4 ]; then
+      meter_over=${meter_over%%.*}
+      meter_over=$(printf '%.4s' "$meter_over")
+    fi
+    meter_age=$(( $(date +%s) - meter_at ))
+
+    # A lock so that a slow sample does not become five slow samples, and a
+    # lock that ages out so that one which never finished does not become a
+    # meter that never updates again.
+    if [ -d "$meter_file.lock" ] \
+       && [ -n "$(find "$meter_file.lock" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then
+      rmdir "$meter_file.lock" 2>/dev/null || true
+    fi
+    if [ "$meter_age" -ge "$meter_every" ] \
+       && mkdir -p "$meter_dir" 2>/dev/null \
+       && mkdir "$meter_file.lock" 2>/dev/null; then
+      # Detached, and with both streams closed: tmux reads a status job's
+      # output until end of file, and a background child holding the pipe
+      # open would hold the whole status line at whatever it last said.
+      (
+        # shellcheck disable=SC2016  # sh for the far side to expand, not us
+        meter_remote='a=$(head -1 /proc/stat); sleep 0.25; b=$(head -1 /proc/stat); echo "$a"; echo "$b"; head -1 /proc/loadavg; nproc'
+        # How to reach the far side, from what imp-proxy wrote down about it.
+        # Absent that, a sprite by that name -- which is what a label is,
+        # unless somebody used -H.
+        meter_kind=sprite
+        for meter_rec in "$meter_dir/$meter_label"-*.json; do
+          [ -r "$meter_rec" ] || continue
+          case "$(cat "$meter_rec")" in *'"kind": "ssh"'*) meter_kind=ssh ;; esac
+        done
+        if [ "$meter_kind" = ssh ]; then
+          meter_raw=$(ssh -o BatchMode=yes -o ConnectTimeout=10 \
+                      "$meter_label" "$meter_remote" 2>/dev/null) || meter_raw=""
+        else
+          meter_raw=$(sprite exec -s "$meter_label" -- sh -c "$meter_remote" \
+                      2>/dev/null) || meter_raw=""
+        fi
+        meter_new=$(printf '%s\n' "$meter_raw" | awk "$meter_awk")
+        if [ -n "$meter_new" ]; then
+          printf '%s %s\n' "$(date +%s)" "$meter_new" > "$meter_file.tmp" \
+            && mv "$meter_file.tmp" "$meter_file"
+        fi
+        rmdir "$meter_file.lock" 2>/dev/null || true
+      ) >/dev/null 2>&1 &
+    fi
+
+    # One field, four characters, always: `58%`, `100%`, `x2.4` when the run
+    # queue is past the core count, `~58%` when the reading is old enough to
+    # be describing a machine that has moved on, `..%` before the first
+    # sample lands. A number with nothing said about its age is the one thing
+    # a meter must not show.
+    #
+    # The percentage gives way to the run queue rather than making room
+    # beside it, because by then it has nothing left to say: at x2.4 the CPU
+    # is at 100% and so it is at x1.0. And the width never changes, because a
+    # status line is read out of the corner of an eye -- a column that shifts
+    # whenever a number does is a column that gets read properly every time.
+    if [ -z "$meter_pct" ]; then
+      meter_val="..%"
+    elif [ "$meter_age" -gt $((meter_every * 4)) ]; then
+      meter_val="~$meter_pct%"       # staleness first: `~x2.4` would not fit
+    elif [ -n "$meter_over" ]; then
+      meter_val=$meter_over
+    else
+      meter_val="$meter_pct%"
+    fi
+    meter_text=$(printf 'spr %4s ' "$meter_val")
+    if [ -n "$meter_hot" ] && [ -n "$meter_pct" ] \
+       && [ "$meter_pct" -ge "$meter_hot_at" ]; then
+      meter_text="$meter_hot$meter_text${meter_style:-#[default]}"
+    fi
+  fi
+
+  # This machine, measured here and now -- it costs a fork, not a round trip.
+  # /proc where there is one, and where there is not, what `ps` believes,
+  # which on macOS is a decaying average per process and close enough for a
+  # bar that redraws every few seconds.
+  if [ -r /proc/stat ]; then
+    meter_a=$(head -1 /proc/stat)
+    sleep 0.2
+    meter_b=$(head -1 /proc/stat)
+    meter_here=$(printf '%s\n%s\n' "$meter_a" "$meter_b" | awk "$meter_awk")
+  else
+    meter_cpus=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+    meter_here=$(ps -A -o %cpu= 2>/dev/null \
+                 | awk -v n="$meter_cpus" '{ s += $1 }
+                        END { if (n < 1) n = 1
+                              p = s / n
+                              if (p > 100) p = 100
+                              printf "%d\n", p + 0.5 }')
+  fi
+  [ -n "$meter_here" ] || meter_here="?"
+  printf '%s%smac %4s%s\n' "$meter_style" "$meter_text" "$meter_here%" \
+         "${meter_style:+#[default]}"
+  exit 0
+fi
+
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
 esac

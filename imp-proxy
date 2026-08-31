@@ -1076,6 +1076,7 @@ class SpriteTarget(object):
     """
 
     needs_relay = True
+    kind = "sprite"
 
     def __init__(self, name):
         self.name = name
@@ -1127,6 +1128,7 @@ class SSHTarget(object):
     """
 
     needs_relay = False
+    kind = "ssh"
 
     def __init__(self, dest):
         self.dest = dest
@@ -1421,6 +1423,10 @@ def save_capability(target, remote_port, capability):
                 json.dump({"capability": capability,
                            "port": remote_port,
                            "target": target.label(),
+                           # Which command reaches it, for anything that has
+                           # only the label -- `imp --meter` samples a sprite
+                           # and an ssh host differently.
+                           "kind": target.kind,
                            "written": int(time.time())}, f)
                 f.write("\n")
             os.chmod(tmp, 0o600)

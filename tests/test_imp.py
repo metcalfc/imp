@@ -18,6 +18,7 @@ Stdlib only, matching the tools. Run: python3 -m unittest discover tests
 """
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -81,12 +82,24 @@ class Harness(object):
             while :; do sleep 0.2; done
         """ % IMP_PROXY)
 
+        # `sprite exec` is what the meter samples through, and the two
+        # /proc/stat lines below are a machine that was busy half the time
+        # between them: 200 ticks passed, 100 of them idle.
+        self.calls = os.path.join(self.dir, "calls")
         for name in ("sprite", "ssh"):
             write_exec(os.path.join(self.bin, name), """
                 #!/bin/bash
+                echo "%s $*" >> %s
+                if [ "${1:-}" = exec ] || [ "${1:-}" = -o ]; then
+                  echo "cpu  100 0 100 800 0 0 0 0 0 0"
+                  echo "cpu  150 0 150 900 0 0 0 0 0 0"
+                  echo "${IMP_TEST_LOADAVG:-0.10} 0.10 0.10 1/200 999"
+                  echo "8"
+                  exit 0
+                fi
                 echo "CONSOLE %s $*"
                 exec bash --norc --noprofile
-            """ % name)
+            """ % (name, self.calls, name))
         write_exec(os.path.join(self.bin, "claude"), """
             #!/bin/bash
             echo CLAUDE RUNNING
@@ -101,6 +114,10 @@ class Harness(object):
         self.scratch = os.path.join(self.dir, "tmp")
         os.mkdir(self.scratch)
         self.env["TMPDIR"] = self.scratch
+        # The meter's cache lives under XDG_STATE_HOME, beside what
+        # imp-proxy writes down; a test run must not read or write the real
+        # one.
+        self.env["XDG_STATE_HOME"] = os.path.join(self.dir, "state")
         self.env.pop("TMUX", None)
         self.env["IMP_TEST_READY_DELAY"] = "1"
 
@@ -642,6 +659,167 @@ class TestTiling(TmuxCase):
         self.assertEqual(r.returncode, 0)
         self.assertEqual(self.h.windows("plain"), ["shell"])
         self.assertEqual(len(self.h.windows()), 4)
+
+
+class TestMeter(TmuxCase):
+    """The status-line segment: how busy the far side is, and how busy this
+    machine is.
+
+    The far side's number is the one that costs a round trip, so what is
+    tested is mostly the caching around it -- that nothing blocks on it, that
+    it is not asked for again while a reading is fresh, and that a reading is
+    never shown without saying how old it is.
+    """
+
+    def setUp(self):
+        TmuxCase.setUp(self)
+        self.h.imp("-s", "foo")
+        self.assertTrue(self.h.wait(lambda: len(self.h.windows()) == 4))
+
+    def meter(self, session="imp-foo"):
+        r = self.h.imp("--meter", session)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip()
+
+    def samples(self):
+        try:
+            with open(self.h.calls) as f:
+                return [l for l in f if " exec " in l]
+        except IOError:
+            return []
+
+    def test_the_local_number_is_there_from_the_first_draw(self):
+        # It costs a fork, not a round trip, so it never has to be waited for.
+        self.assertRegex(self.meter(), r"mac\s+\d+%")
+
+    def test_the_far_sides_number_is_not_waited_for(self):
+        # Nothing has been sampled yet, and the first draw still returns.
+        self.assertRegex(self.meter(), r"spr\s+\.\.%")
+
+    def test_a_sample_lands_and_is_shown(self):
+        self.meter()
+        self.assertTrue(self.h.wait(lambda: re.search(r"spr\s+50%", self.meter())),
+                        "no reading arrived: %r" % self.meter())
+
+    def test_a_fresh_reading_is_not_asked_for_again(self):
+        self.meter()
+        self.assertTrue(self.h.wait(lambda: re.search(r"spr\s+50%", self.meter())))
+        before = len(self.samples())
+        for _ in range(4):
+            self.meter()
+        self.assertEqual(len(self.samples()), before,
+                         "the meter went back to the sprite while its "
+                         "reading was still fresh")
+
+    def test_a_run_queue_past_the_core_count_is_shown(self):
+        # A percentage saturates at 100 and stops answering the question the
+        # meter is there for: one test suite or three?
+        self.h.env["IMP_TEST_LOADAVG"] = "20.0"
+        self.meter()
+        self.assertTrue(self.h.wait(lambda: re.search(r"spr\s+x2\.5", self.meter())),
+                        "no over-subscription figure: %r" % self.meter())
+        # And it takes the percentage's place rather than widening the bar.
+        self.assertNotIn("50%", self.meter())
+
+    def test_a_badly_oversubscribed_far_side_still_fits_its_column(self):
+        # x12.5 is one character wider than x2.4, and one character is all it
+        # takes to move `mac` about.
+        path = os.path.join(self.h.env["XDG_STATE_HOME"], "imp", "meter-foo")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        widths = set()
+        for line in ("50", "50 2.5", "50 13", "50 12.5", "50 1000.25"):
+            with open(path, "w") as f:
+                f.write("%d %s\n" % (time.time(), line))
+            widths.add(len(self.meter()))
+        self.assertEqual(len(widths), 1, sorted(widths))
+
+    def test_a_run_queue_of_ten_cores_loses_the_decimal(self):
+        self.h.env["IMP_TEST_LOADAVG"] = "104.0"
+        self.meter()
+        self.assertTrue(self.h.wait(lambda: re.search(r"x13\b", self.meter())),
+                        "expected x13 for 104 over 8 cores: %r" % self.meter())
+
+    def test_a_quiet_run_queue_is_not_shown_at_all(self):
+        self.meter()
+        self.assertTrue(self.h.wait(lambda: re.search(r"spr\s+50%", self.meter())))
+        self.assertNotIn("x", self.meter().replace("mac", ""))
+
+    def test_the_columns_hold_still_when_a_number_narrows(self):
+        # The whole reason for the padding: 10% dropping to 9% must not drag
+        # everything beside it one character to the right.
+        self.meter()
+        self.assertTrue(self.h.wait(lambda: re.search(r"spr\s+50%", self.meter())))
+        path = os.path.join(self.h.env["XDG_STATE_HOME"], "imp", "meter-foo")
+        widths = set()
+        for pct in ("9", "10", "99", "100"):
+            with open(path, "w") as f:
+                f.write("%d %s\n" % (time.time(), pct))
+            widths.add(len(self.meter()))
+        self.assertEqual(len(widths), 1,
+                         "the segment changed width with the number: %r"
+                         % (sorted(widths),))
+
+    def test_the_run_queue_keeps_its_column_when_it_is_not_there(self):
+        path = os.path.join(self.h.env["XDG_STATE_HOME"], "imp", "meter-foo")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        widths = set()
+        for line in ("50", "50 2.5"):
+            with open(path, "w") as f:
+                f.write("%d %s\n" % (time.time(), line))
+            widths.add(len(self.meter()))
+        self.assertEqual(len(widths), 1,
+                         "the run queue moved `mac` when it appeared: %r"
+                         % (sorted(widths),))
+
+    def test_an_old_reading_says_that_it_is_old(self):
+        # A number with nothing said about its age is the one thing a meter
+        # must not show.
+        self.meter()
+        self.assertTrue(self.h.wait(lambda: re.search(r"spr\s+50%", self.meter())))
+        path = os.path.join(self.h.env["XDG_STATE_HOME"], "imp", "meter-foo")
+        with open(path, "w") as f:
+            f.write("%d 50\n" % (time.time() - 3600))
+        self.assertRegex(self.meter(), r"spr\s+~50%")
+
+    def test_a_session_that_ended_is_not_an_error(self):
+        # The status line asks for a session that was there when it redrew;
+        # by the time the job answers it may not be. That costs the far
+        # side's number, not the segment.
+        out = self.meter("imp-gone")
+        self.assertNotIn("spr", out)
+        self.assertRegex(out, r"mac\s+\d+%")
+
+    def test_a_session_that_is_not_imps_has_no_far_side(self):
+        self.h.tmux("new-session", "-d", "-s", "plain", "-n", "shell",
+                    "sleep 300")
+        out = self.meter("plain")
+        self.assertNotIn("spr", out)
+        self.assertRegex(out, r"mac\s+\d+%")
+        self.assertEqual(self.samples(), [])
+
+    def test_it_styles_the_far_side_when_it_is_hot(self):
+        self.h.env["IMP_METER_HOT"] = "#[fg=red]"
+        self.h.env["IMP_METER_HOT_AT"] = "40"
+        self.meter()
+        self.assertTrue(self.h.wait(lambda: re.search(r"spr\s+50%", self.meter())))
+        self.assertRegex(self.meter(), r"#\[fg=red\]spr\s+50%")
+
+    def test_it_is_quiet_about_a_far_side_it_cannot_reach(self):
+        # Only once the consoles have actually reached the stub: replacing it
+        # while a pane is still on its way into it kills the console, and
+        # three dead consoles are the reaper's business, not the meter's.
+        for wid in self.h.consoles():
+            self.assertTrue(self.h.wait(
+                lambda w=wid: "CONSOLE sprite" in self.h.pane_text(w)))
+        write_exec(os.path.join(self.h.bin, "sprite"), """
+            #!/bin/bash
+            exit 1
+        """)
+        self.meter()
+        time.sleep(1.5)
+        out = self.meter()
+        self.assertRegex(out, r"spr\s+\.\.%")
+        self.assertRegex(out, r"mac\s+\d+%")
 
 
 class TestKeyBindings(TmuxCase):
