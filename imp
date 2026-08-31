@@ -373,23 +373,47 @@ if [ "${1:-}" = --meter ]; then
     fi
   fi
 
-  # This machine, measured here and now -- it costs a fork, not a round trip.
-  # /proc where there is one, and where there is not, what `ps` believes,
-  # which on macOS is a decaying average per process and close enough for a
-  # bar that redraws every few seconds.
-  if [ -r /proc/stat ]; then
-    meter_a=$(head -1 /proc/stat)
-    sleep 0.2
-    meter_b=$(head -1 /proc/stat)
-    meter_here=$(printf '%s\n%s\n' "$meter_a" "$meter_b" | awk "$meter_awk")
-  else
-    meter_cpus=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
-    meter_here=$(ps -A -o %cpu= 2>/dev/null \
-                 | awk -v n="$meter_cpus" '{ s += $1 }
-                        END { if (n < 1) n = 1
-                              p = s / n
-                              if (p > 100) p = 100
-                              printf "%d\n", p + 0.5 }')
+  # This machine, measured here and not asked for over a wire -- it costs a
+  # fork, not a round trip. Written down all the same, and the reason is not
+  # cost: recomputed on every draw the number moves on every draw, and a
+  # figure that never sits still is one you keep reading. Fifteen seconds is
+  # long enough to be still and short enough to catch a build starting.
+  # IMP_METER_LOCAL_INTERVAL=0 puts it back to every draw.
+  #
+  # `meter.local`, with a dot: a label is sanitised to letters, digits, `_`
+  # and `-`, so no sprite can be called this and take the file.
+  meter_mine="$meter_dir/meter.local"
+  meter_mine_at=0; meter_here=""
+  if [ -r "$meter_mine" ]; then
+    read -r meter_mine_at meter_here < "$meter_mine" || true
+  fi
+  case "$meter_mine_at" in ""|*[!0-9]*) meter_mine_at=0 ;; esac
+  case "$meter_here" in ""|*[!0-9]*) meter_here="" ;; esac
+  if [ -z "$meter_here" ] \
+     || [ $(( $(date +%s) - meter_mine_at )) -ge "${IMP_METER_LOCAL_INTERVAL:-15}" ]; then
+    # /proc where there is one, and where there is not, what `ps` believes,
+    # which on macOS is a decaying average per process and close enough for a
+    # bar that redraws every few seconds.
+    if [ -r /proc/stat ]; then
+      meter_a=$(head -1 /proc/stat)
+      sleep 0.2
+      meter_b=$(head -1 /proc/stat)
+      meter_here=$(printf '%s\n%s\n' "$meter_a" "$meter_b" | awk "$meter_awk")
+    else
+      meter_cpus=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+      meter_here=$(ps -A -o %cpu= 2>/dev/null \
+                   | awk -v n="$meter_cpus" '{ s += $1 }
+                          END { if (n < 1) n = 1
+                                p = s / n
+                                if (p > 100) p = 100
+                                printf "%d\n", p + 0.5 }')
+    fi
+    # A unique temp name, because every session on this machine draws its own
+    # bar and they all keep this one file.
+    if [ -n "$meter_here" ] && mkdir -p "$meter_dir" 2>/dev/null; then
+      { printf '%s %s\n' "$(date +%s)" "$meter_here" > "$meter_mine.$$" \
+        && mv "$meter_mine.$$" "$meter_mine"; } 2>/dev/null || true
+    fi
   fi
   [ -n "$meter_here" ] || meter_here="?"
   printf '%s%smac %4s%s\n' "$meter_style" "$meter_text" "$meter_here%" \

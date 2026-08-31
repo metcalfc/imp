@@ -846,6 +846,41 @@ class TestMeter(TmuxCase):
             f.write("%d 50\n" % (time.time() - 3600))
         self.assertRegex(self.meter(), r"spr\s+~50%")
 
+    def local_cache(self):
+        return os.path.join(self.h.env["XDG_STATE_HOME"], "imp", "meter.local")
+
+    def test_the_local_number_holds_still_between_draws(self):
+        # It costs a fork rather than a round trip, so this is not about
+        # cost: a number recomputed on every draw moves on every draw, and a
+        # bar that never sits still is one you keep reading.
+        first = self.meter()
+        self.assertEqual([self.meter() for _ in range(3)], [first] * 3)
+
+    def test_a_written_down_local_number_is_the_one_shown(self):
+        path = self.local_cache()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("%d 42\n" % time.time())
+        self.assertIn("mac  42%", self.meter())
+
+    def test_an_old_local_number_is_measured_again(self):
+        path = self.local_cache()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("%d 42\n" % (time.time() - 3600))
+        self.meter()
+        with open(path) as f:
+            at, _ = f.read().split()
+        self.assertGreater(int(at), time.time() - 60)
+
+    def test_it_can_be_told_to_measure_every_draw(self):
+        self.h.env["IMP_METER_LOCAL_INTERVAL"] = "0"
+        path = self.local_cache()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("%d 42\n" % time.time())
+        self.assertNotIn("mac  42%", self.meter())
+
     def test_a_session_that_ended_is_not_an_error(self):
         # The status line asks for a session that was there when it redrew;
         # by the time the job answers it may not be. That costs the far

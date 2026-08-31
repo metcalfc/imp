@@ -498,6 +498,10 @@ tmux expands `#{session_name}` before running the command, so the segment
 knows which session it is drawing for; a session that is not one of imp's has
 no far side and gets the local number alone.
 
+Both numbers are written down rather than taken fresh each time, and the local
+one is cached for a reason that is not cost: recomputed on every draw it moves
+on every draw, and a figure that never sits still is one you keep reading.
+
 Nothing in the status line waits on the network. The far side's figure comes
 out of a file that a detached sample refreshes at most every 20 seconds, and
 the segment only ever reads it — a status job that blocks on ssh blocks every
@@ -508,6 +512,7 @@ and leaves the sprite to fall idle rather than poking it awake all afternoon.
 | | |
 |---|---|
 | `IMP_METER_INTERVAL` | seconds between samples of the far side (default 20) |
+| `IMP_METER_LOCAL_INTERVAL` | seconds between measurements of this machine (default 15; 0 measures on every draw) |
 | `IMP_METER_STYLE` | a tmux style for the segment, e.g. `#[fg=#6e738d]` |
 | `IMP_METER_HOT` | a style for the sprite's figure once it is over the threshold |
 | `IMP_METER_HOT_AT` | that threshold, as a percentage (default 85) |
