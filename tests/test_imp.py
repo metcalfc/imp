@@ -180,6 +180,28 @@ class Harness(object):
         ids = self.window_ids("imp:" + label, session)
         return ids[0] if ids else None
 
+    def revoke_proxy(self, label="foo", session="imp-foo"):
+        """Ctrl-C in the proxy window, the way a session loses it. True if
+        the window went.
+
+        Waited for and retried, because a keystroke is not a function call.
+        The proxy installs its INT handler a moment after it starts, and a
+        C-c that lands before that kills the pane by signal instead -- which
+        `remain-on-exit failed` rightly keeps on screen, leaving a window
+        that never closes and a test that fails on the wait rather than on
+        the thing it was about.
+        """
+        win = self.proxy_window(label, session)
+        if not win or not self.wait(
+                lambda: "PROXY READY" in self.pane_text(win)):
+            return False
+        for _ in range(5):
+            self.tmux("send-keys", "-t", win, "C-c")
+            if self.wait(lambda: ("imp:" + label) not in self.windows(session),
+                         3.0):
+                return True
+        return False
+
     def pane_text(self, target):
         r = self.tmux("capture-pane", "-p", "-t", target)
         return r.stdout if r.returncode == 0 else ""
@@ -491,9 +513,9 @@ class TestEndingASession(TmuxCase):
 
     def test_the_proxy_exiting_leaves_the_consoles_running(self):
         # Ctrl-C in the proxy window is a clean exit: revoke, keep working.
-        self.h.tmux("send-keys", "-t", self.h.proxy_window(), "C-c")
-        self.assertTrue(self.h.wait(
-            lambda: "imp:foo" not in self.h.windows()))
+        self.assertTrue(self.h.revoke_proxy(),
+                        "the proxy window outlived Ctrl-C: %r"
+                        % (self.h.windows(),))
         self.assertEqual(self.h.windows(), ["claude:foo"] * 3)
 
 
@@ -507,25 +529,9 @@ class TestReattach(TmuxCase):
     """
 
     def revoke(self):
-        """Ctrl-C in the proxy window, which is how a session loses it.
-
-        Waited for and retried, because a keystroke is not a function call.
-        The stub proxy installs its INT trap a line after it starts, and a
-        C-c that lands before that kills the pane by signal instead -- which
-        `remain-on-exit failed` rightly keeps on screen, leaving a window
-        that never closes and a test that fails a minute later somewhere
-        else. So: not before it says it is ready, and again if the first one
-        did not take.
-        """
-        win = self.h.proxy_window()
-        self.assertTrue(self.h.wait(
-            lambda: "PROXY READY" in self.h.pane_text(win)),
-            "the proxy never reported ready")
-        for _ in range(5):
-            self.h.tmux("send-keys", "-t", win, "C-c")
-            if self.h.wait(lambda: "imp:foo" not in self.h.windows(), 3.0):
-                return
-        self.fail("the proxy window outlived Ctrl-C: %r" % (self.h.windows(),))
+        self.assertTrue(self.h.revoke_proxy(),
+                        "the proxy window outlived Ctrl-C: %r"
+                        % (self.h.windows(),))
 
     def setUp(self):
         TmuxCase.setUp(self)
