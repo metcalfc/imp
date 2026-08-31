@@ -27,12 +27,14 @@ python3 on the sprite.
 
 import argparse
 import base64
+import http.client
 import json
 import os
 import platform
 import posixpath
 import queue
 import re
+import shlex
 import signal
 import socket
 import socketserver
@@ -41,9 +43,7 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 
 UPSTREAM = "https://api.anthropic.com"
 
@@ -81,6 +81,14 @@ MAX_STREAMS = 256               # concurrent proxied connections
 # that pauses to render a long response is slow, not stuck -- be generous.
 MAX_STREAM_BUFFER = 8 * 1024 * 1024
 SETTINGS_TIMEOUT = 30.0         # ssh round trip for settings.json
+
+# A long inference call streams for minutes, so the socket timeout has to be
+# generous; it exists to stop a wedged connection pinning a thread forever.
+UPSTREAM_TIMEOUT = 600.0
+# How long a kept connection may sit idle before we open a new one instead.
+# A connection the far end closed while we were not looking costs a retry to
+# discover; below the usual edge idle timeout, we mostly do not find out.
+UPSTREAM_MAX_IDLE = 55.0
 
 
 def log(*a):
@@ -276,21 +284,103 @@ HOP = {"host", "accept-encoding", "content-length", "connection", "keep-alive",
        "transfer-encoding", "upgrade"}
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Refuse to follow redirects.
+class Upstream(object):
+    """One kept-alive connection to the API per handler thread.
 
-    urllib's default handler copies Authorization into the redirected request
-    without checking the origin, so a 3xx would hand the real token to
-    whatever host the Location names. Returning None leaves the 3xx to
-    surface as an HTTPError, which we pass back to the sprite verbatim --
-    it can decide what to do with it, without our credential.
+    http.client rather than urllib.request, for two reasons.
+
+    Redirects: urllib's default handler copies Authorization into the
+    redirected request without checking the origin, so a 3xx would hand the
+    real token to whatever host the Location names. It took a handler
+    subclass to say no. http.client does not follow redirects at all -- the
+    3xx comes back like any other response and goes to the sprite verbatim,
+    for it to decide about without our credential.
+
+    Reuse: urllib opens a fresh connection per request, so every message paid
+    a full TLS handshake to api.anthropic.com. That handshake was most of
+    what imp added on top of talking to the API directly. Threads here are
+    one per client connection, so a thread-local connection lines the two
+    lifetimes up: one `claude` conversation, one connection at each end, and
+    nothing shared between threads to lock.
     """
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+    def __init__(self):
+        self._local = threading.local()
+
+    def _target(self):
+        u = urllib.parse.urlsplit(UPSTREAM)
+        return u.scheme, u.hostname, u.port
+
+    def _open(self):
+        scheme, host, port = self._target()
+        cls = (http.client.HTTPSConnection if scheme == "https"
+               else http.client.HTTPConnection)
+        conn = cls(host, port, timeout=UPSTREAM_TIMEOUT)
+        self._local.conn = conn
+        self._local.key = (scheme, host, port)
+        self._local.used = time.time()
+        return conn
+
+    def discard(self):
+        """Throw the kept connection away. Safe to call at any point."""
+        conn = getattr(self._local, "conn", None)
+        self._local.conn = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def send(self, method, target, body, headers):
+        """Return (response, error); exactly one of the two is None.
+
+        A kept connection the far end has already closed is indistinguishable
+        from a live one until we write to it. That failure costs one retry on
+        a fresh connection -- safe to repeat regardless of method, because a
+        request that died on the way out was never seen upstream.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is not None and (
+                getattr(self._local, "key", None) != self._target()
+                or time.time() - getattr(self._local, "used", 0.0) > UPSTREAM_MAX_IDLE):
+            self.discard()
+            conn = None
+        reused = conn is not None
+        if conn is None:
+            conn = self._open()
+        while True:
+            try:
+                conn.request(method, target, body=body, headers=headers)
+                resp = conn.getresponse()
+                self._local.used = time.time()
+                return resp, None
+            except Exception as e:
+                self.discard()
+                if not reused:
+                    return None, e
+                reused = False
+                conn = self._open()
+
+    def release(self, resp, complete):
+        """Hand the connection back, or throw it away.
+
+        Only a response read to the end leaves the connection at a message
+        boundary. A client that hung up mid-stream, or an upstream that said
+        `Connection: close`, leaves bytes we would otherwise read as the head
+        of the next response.
+        """
+        if resp is None:
+            return
+        will_close = getattr(resp, "will_close", True)
+        try:
+            resp.close()
+        except Exception:
+            pass
+        if will_close or not complete:
+            self.discard()
 
 
-OPENER = urllib.request.build_opener(_NoRedirect)
+UPSTREAM_CONN = Upstream()
 
 
 def _drop(conn):
@@ -309,14 +399,6 @@ def _drop(conn):
         pass
 
 
-def _close(resp):
-    """Release an upstream response -- an HTTPError body holds a socket too."""
-    try:
-        resp.close()
-    except Exception:
-        pass
-
-
 class Credential(object):
     """Holds the live token. Re-read on a 401 so a long session survives the
     access token rolling underneath it -- Claude Code on this machine refreshes
@@ -331,7 +413,13 @@ class Credential(object):
             old = self.token
             try:
                 self.token, self.source = load_credential()
-            except SystemExit as e:
+            except (Exception, SystemExit) as e:
+                # SystemExit is "no credential found", but the keychain and
+                # ~/.claude/.credentials.json can also be unreadable or
+                # half-written under us. Losing a refresh is survivable;
+                # letting it out of this method is not -- it would surface in
+                # the handler thread as a dropped connection, where passing
+                # the upstream 401 back was the answer.
                 log("credential refresh failed: %s" % e)
                 return False
             return self.token != old
@@ -345,6 +433,17 @@ def make_proxy_handler(cred, capability, verbose, allowed):
 
         def log_message(self, fmt, *args):
             pass
+
+        def finish(self):
+            # A thread here is one client connection, so when it ends the
+            # kept upstream connection has no next request to serve. Closed
+            # on the way out rather than left to the garbage collector --
+            # which is where it otherwise surfaced, as a ResourceWarning and
+            # a socket held open for as long as the collector felt like it.
+            try:
+                http.server.BaseHTTPRequestHandler.finish(self)
+            finally:
+                UPSTREAM_CONN.discard()
 
         # The target is the sprite's to choose, so it reaches our terminal
         # only as printable ASCII, clipped: a request line can carry 64 KB of
@@ -385,16 +484,25 @@ def make_proxy_handler(cred, capability, verbose, allowed):
             if len(q) == 2:
                 target += "?" + q[1]
 
-            fwd = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
-            fwd["Accept-Encoding"] = "identity"
+            # Folded to lower case on the way in. Header names are
+            # case-insensitive but a dict is not, and every lookup below is a
+            # dict lookup: with the sprite's spelling kept, an
+            # `Anthropic-Beta` slid past the `anthropic-beta` merge and its
+            # betas were dropped on the floor. One spelling from here on, so
+            # a repeated header collapses here rather than somewhere further
+            # down -- and so popping two keys strips every credential header
+            # the sprite sent, whatever case it chose for them.
+            fwd = {}
+            for k, v in self.headers.items():
+                k = k.lower()
+                if k not in HOP:
+                    fwd[k] = v
+            fwd["accept-encoding"] = "identity"
 
-            # Strip *every* credential header the sprite sent, not just the
-            # first -- `presented or fwd.pop(k)` would short-circuit and
-            # forward a second one upstream alongside the real token.
             presented = ""
-            for k in list(fwd):
-                if k.lower() in ("authorization", "x-api-key"):
-                    v = fwd.pop(k)
+            for k in ("authorization", "x-api-key"):
+                v = fwd.pop(k, None)
+                if v is not None:
                     presented = presented or v
             presented = presented[7:] if presented.lower().startswith("bearer ") else presented
 
@@ -422,8 +530,9 @@ def make_proxy_handler(cred, capability, verbose, allowed):
                 return
             body = self.rfile.read(length) if length else b""
 
-            fwd["Authorization"] = "Bearer " + cred.token
-            betas = [b for b in (fwd.get("anthropic-beta") or "").split(",") if b]
+            fwd["authorization"] = "Bearer " + cred.token
+            betas = [b.strip() for b in (fwd.get("anthropic-beta") or "").split(",")]
+            betas = [b for b in betas if b]
             for b in REQUIRED_BETAS:
                 if b not in betas:
                     betas.insert(0, b)
@@ -433,36 +542,36 @@ def make_proxy_handler(cred, capability, verbose, allowed):
             if verbose:
                 log("%s %s (%d bytes up)" % (self.command, target, len(body)))
 
-            def attempt():
-                req = urllib.request.Request(UPSTREAM + target, data=body or None,
-                                             headers=fwd, method=self.command)
-                try:
-                    r = OPENER.open(req, timeout=600)
-                    return r, r.getcode(), None
-                except urllib.error.HTTPError as e:
-                    return e, e.code, None
-                except Exception as e:
-                    return None, None, e
-
-            resp, code, err = attempt()
-            if code == 401 and cred.refresh():
+            resp, err = UPSTREAM_CONN.send(self.command, target, body, fwd)
+            if err is None and resp.status == 401 and cred.refresh():
                 log("upstream 401 -- reloaded credential, retrying")
-                _close(resp)          # the 401 body still owns a socket
-                fwd["Authorization"] = "Bearer " + cred.token
-                resp, code, err = attempt()
+                # Read the 401 body out before reusing the connection; an
+                # unread body is the next response as far as the socket knows.
+                try:
+                    resp.read()
+                    drained = True
+                except Exception:
+                    drained = False
+                UPSTREAM_CONN.release(resp, drained)
+                fwd["authorization"] = "Bearer " + cred.token
+                resp, err = UPSTREAM_CONN.send(self.command, target, body, fwd)
             if err is not None:
                 log("upstream error: %r" % (err,))
                 self._reject(502, "upstream error")
                 return
 
-            self.send_response(code)
-            for k, v in resp.headers.items():
+            self.send_response(resp.status)
+            for k, v in resp.getheaders():
                 if k.lower() not in HOP:
                     self.send_header(k, v)
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
 
             # Streamed verbatim so SSE arrives token-by-token, not buffered.
+            # `complete` is set the moment upstream is drained, before the
+            # terminating chunk goes out: a client that hangs up on that last
+            # write has cost us nothing, and the connection is still good.
+            complete = False
             try:
                 while True:
                     chunk = resp.read(4096)
@@ -470,10 +579,11 @@ def make_proxy_handler(cred, capability, verbose, allowed):
                         break
                     self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
                     self.wfile.flush()
+                complete = True
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
             finally:
-                _close(resp)
+                UPSTREAM_CONN.release(resp, complete)
 
         do_GET = do_POST = do_PUT = do_DELETE = _proxy
 
@@ -971,6 +1081,23 @@ class SpriteTarget(object):
     def label(self):
         return self.name or "(from .sprite)"
 
+    def short_label(self):
+        """A name for a tmux window. `.sprite` is read here and only here --
+        for a label, where being wrong is cosmetic."""
+        if self.name:
+            return self.name
+        try:
+            with open(".sprite") as f:
+                return f.readline().strip() or "sprite"
+        except OSError:
+            return "sprite"
+
+    def console_argv(self):
+        argv = ["sprite", "console"]
+        if self.name:
+            argv += ["-s", self.name]
+        return argv
+
     def exec_argv(self, remote_cmd):
         proxy_cmd = "sprite proxy --ssh"
         if self.name:
@@ -1004,6 +1131,14 @@ class SSHTarget(object):
 
     def label(self):
         return self.dest
+
+    def short_label(self):
+        return self.dest
+
+    def console_argv(self):
+        # -t because this is a person's shell: without a tty you get no
+        # prompt, no job control and no `claude`.
+        return ["ssh", "-t", self.dest]
 
     def exec_argv(self, remote_cmd):
         return ["ssh"] + SSH_COMMON + [self.dest, remote_cmd]
@@ -1178,6 +1313,55 @@ def clear_target(target):
 
 # --------------------------------------------------------------------------
 
+def port_arg(s):
+    """A port, checked here rather than discovered as a bind failure -- or,
+    for 0, as a settings.json pointing at http://127.0.0.1:0."""
+    try:
+        n = int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError("%r is not a number" % s)
+    if not 1 <= n <= 65535:
+        raise argparse.ArgumentTypeError("port must be 1-65535, not %d" % n)
+    return n
+
+
+def consoles_arg(s):
+    try:
+        n = int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError("%r is not a number" % s)
+    if not 1 <= n <= 32:
+        raise argparse.ArgumentTypeError("consoles must be 1-32, not %d" % n)
+    return n
+
+
+def set_ready(path, ready):
+    """Raise or lower the readiness flag `imp` waits on.
+
+    A file, not a line on stderr. The thing waiting is a shell script, and
+    `test -e` is the whole of what it has to be able to do -- scraping the
+    log for the word `ready` would make that log a format nobody meant to
+    promise. Best-effort in both directions: nothing here is worth failing a
+    session over, and the file lives in a directory `imp` cleans up anyway.
+    """
+    if not path:
+        return
+    try:
+        if ready:
+            with open(path, "w") as f:
+                f.write("ready\n")
+        else:
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def tmux_label(name):
+    """A window name `imp` can pass to tmux without quoting worries."""
+    safe = "".join(c if (c.isalnum() or c in "_-") else "-" for c in name)
+    return safe or "sprite"
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="imp-proxy",
@@ -1193,7 +1377,7 @@ def main():
     ap.add_argument("-H", "--host", default="",
                     help="an ssh destination instead of a sprite -- anything "
                          "`ssh` accepts, including a Host from your ssh config")
-    ap.add_argument("-p", "--remote-port", type=int, default=8080,
+    ap.add_argument("-p", "--remote-port", type=port_arg, default=8080,
                     help="port to listen on at the far end (default 8080)")
     ap.add_argument("--no-settings", action="store_true",
                     help="do not touch the far side's ~/.claude/settings.json; "
@@ -1210,8 +1394,19 @@ def main():
                          "left it, and say whether anything is still behind "
                          "it. The way out of a pointer with nothing running "
                          "under it; starts no proxy and reads no credential")
+    ap.add_argument("-n", "--consoles", type=consoles_arg, default=3,
+                    help="how many console windows `imp` should open "
+                         "(default 3). Ignored when imp-proxy is run "
+                         "directly -- it opens no windows")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="log each proxied request")
+    # Written when the far side is actually funded, removed on the way out.
+    # `imp` waits on it before starting `claude` in its console windows.
+    ap.add_argument("--ready-file", default="", help=argparse.SUPPRESS)
+    # For `imp`, which needs to know which console to open beside us. Not in
+    # --help: it is one program talking to another, not a thing to run.
+    ap.add_argument("--print-console", action="store_true",
+                    help=argparse.SUPPRESS)
     args = ap.parse_args()
     if args.host and args.sprite:
         die("-s and -H name two different machines; pick one.")
@@ -1219,6 +1414,22 @@ def main():
         target = SSHTarget(args.host)
     else:
         target = SpriteTarget(resolve_sprite(args.sprite))
+
+    if args.print_console:
+        # `imp` asks us instead of parsing argv itself. argparse accepts
+        # -sNAME, --sprite=NAME and any unambiguous abbreviation, and a shell
+        # loop that only knew "-s NAME" answered "no sprite named" to all
+        # three -- opening a console on a different machine than the one
+        # being funded. One parser, one answer, and the drift cannot recur.
+        #
+        # Three lines: whether this invocation is a session at all, a window
+        # label, and the console command ready for a shell to re-parse.
+        print("mode=%s" % ("oneshot" if args.clear else "session"))
+        print("label=%s" % tmux_label(target.short_label()))
+        print("consoles=%d" % args.consoles)
+        print("console=%s" % " ".join(shlex.quote(a)
+                                      for a in target.console_argv()))
+        return 0
 
     if args.clear:
         return clear_target(target)
@@ -1309,20 +1520,26 @@ def main():
         except OSError:
             pass
         # The pointer went in before the link was tried, so a link that never
-        # came up leaves one to take back out.
+        # came up leaves one to take back out. Said out loud when it fails,
+        # the way the teardown below does -- a pointer left behind is the
+        # thing the next run will refuse to start over.
         if settings_written:
-            write_remote_settings(target, "", capability)
+            ok, msg = write_remote_settings(target, "", capability)
+            if not ok:
+                log("left an inert capability in settings.json (%s)" % msg)
         proxy.shutdown()
         return 1
 
     log("ready -- `claude` on %s now runs on your Max subscription."
         % target.label())
     log("Ctrl-C revokes instantly. Nothing to clean up there.")
+    set_ready(args.ready_file, True)
 
     try:
         while proc.poll() is None and (mux is None or mux.alive):
             time.sleep(0.25)
     finally:
+        set_ready(args.ready_file, False)
         log("link closed -- access revoked")
         try:
             proc.terminate()

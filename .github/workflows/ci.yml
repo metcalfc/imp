@@ -61,6 +61,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # The `imp` tests drive a real tmux on a private socket. They skip
+      # themselves where it is missing, and a silent skip of the wrapper's
+      # whole test file is not what we want from CI on the platform that can
+      # cheaply have it.
+      - name: tmux
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends tmux && tmux -V
+
       # No third-party packages on either end -- that is a feature, so the
       # test run installs nothing either.
       - name: unittest

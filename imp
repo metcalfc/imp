@@ -1,28 +1,37 @@
 #!/bin/bash
-# imp — get a sprite console with imp-proxy already running beside it.
+# imp — three claude sessions on a sprite, with imp-proxy funding them.
 #
-# Sugar, nothing more. These are two commands you could type yourself:
+# Sugar, nothing more. These are commands you could type yourself:
 #
 #     imp-proxy -s NAME          # lend the sprite your subscription
-#     sprite console -s NAME     # get a shell on it
+#     sprite console -s NAME     # get a shell on it, then run `claude`
 #
 # or, for any host you can ssh to:
 #
 #     imp-proxy -H box
 #     ssh -t box
 #
-# You would type the sprite name twice and juggle two terminals. This types it
-# once and puts them in one tmux window -- console on top, the proxy's log in
-# a strip along the bottom where you can see `ready`, `rejected:` and the rest
-# of what it has to say.
+# You would type the name once per terminal and watch the proxy in none of
+# them. This types it once and lays out a tmux session:
+#
+#     window 0  imp:NAME      the proxy, and its log
+#     window 1  claude:NAME   a console with `claude` running in it
+#     window 2  claude:NAME
+#     window 3  claude:NAME
+#
+# Ctrl-B n walks all four. Ctrl-B C-n walks only the claude windows, which is
+# the one you want when you are actually working; Ctrl-B C-p goes back.
 #
 # Everything of consequence stays in imp-proxy: the credential, the path
-# allowlist, the capability. This script never touches any of them, and it
-# deliberately validates nothing imp-proxy validates -- no sprite selected is
-# imp-proxy's error to report, in the words it already uses.
+# allowlist, the capability. This script never touches any of them. It does
+# not parse the arguments either -- it asks imp-proxy what they meant. An
+# earlier version scanned for `-s NAME` in bash and so did not recognise
+# -sNAME, --sprite=NAME or --spr NAME, all of which imp-proxy accepts; each
+# one funded one machine and opened a console on another. There is one
+# parser now, and it is argparse.
 #
-# tmux is not required. Without it this is exactly `imp-proxy`, and you open a
-# console wherever you like.
+# tmux is not required. Without it this is exactly `imp-proxy`, and you open
+# consoles wherever you like.
 
 set -euo pipefail
 
@@ -30,19 +39,59 @@ die() { printf 'imp: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat >&2 <<'USAGE'
-usage: imp [-s NAME | -H HOST] [imp-proxy options...]
+usage: imp [-s NAME | -H HOST] [-n COUNT] [imp-proxy options...]
 
-Opens a tmux window: a console above, `imp-proxy` below. -s gets you a sprite
-console, -H an ssh session to any host you own. Every option
-is passed through to imp-proxy untouched -- see `imp-proxy --help`.
+Opens a tmux session: imp-proxy in the first window, then COUNT console
+windows (3 by default) each running `claude`. -s gets you sprite consoles,
+-H ssh sessions to any host you own. Every option is passed through to
+imp-proxy untouched -- see `imp-proxy --help`.
 
-Ctrl-C in the lower pane revokes the sprite's access, exactly as it always
-has, and takes the pane with it -- leaving you the console, now unfunded.
-Closing the window revokes too.
+  Ctrl-B n      next window, including the proxy
+  Ctrl-B C-n    next claude window, skipping the proxy  (C-p for previous)
 
-To lend it again without a fresh window: split and run imp-proxy yourself.
+`claude` is started in each console once the proxy reports ready, not before:
+it reads settings.json at startup, and settings.json is what imp-proxy is
+still writing for the first second or two.
+
+Ctrl-C in the proxy window revokes access, exactly as it always has, and
+takes that window with it -- leaving the consoles, now unfunded. Closing the
+last claude window revokes too, and ends the session.
 USAGE
 }
+
+# Hidden, and not for people: the tmux hook at the bottom calls this whenever
+# a window closes. Keeping it here rather than inline in the hook means the
+# logic is bash that can be read and tested, not a string escaped through
+# tmux's parser and then a shell's.
+if [ "${1:-}" = --reap ]; then
+  [ $# -eq 3 ] || exit 0
+  reap_label=$2; reap_win=$3
+  # Two things here are deliberate, and both were bugs that ended a healthy
+  # session about half a second after imp built it.
+  #
+  # A window id (@7), never a session id ($2): the hook body is re-read by
+  # /bin/sh, where a session id beginning with `$` becomes the shell's own
+  # $2 and addresses nothing. A window id resolves to its session for both
+  # commands below and contains no character sh wants.
+  #
+  # And no pipe into `grep -q`: under `set -o pipefail` grep exits at the
+  # first match, tmux takes SIGPIPE writing to the closed pipe, and the
+  # pipeline reports failure -- so a session full of consoles read as none.
+  reap_names=$(tmux list-windows -t "$reap_win" -F '#{window_name}' 2>/dev/null || true)
+  if ! grep -qx "claude:$reap_label" <<EOF
+$reap_names
+EOF
+  then
+    # The last console is gone, so nothing is left for the proxy to fund.
+    # Unhook before killing: afterwards there is no window to address.
+    # Killing the window sends the proxy SIGHUP, which it handles -- the far
+    # side's settings.json is cleared on the way out. In a session imp
+    # created this also empties it, and tmux ends the session for us.
+    tmux set-hook -u -t "$reap_win" window-unlinked 2>/dev/null || true
+    tmux kill-window -t "$reap_win" 2>/dev/null || true
+  fi
+  exit 0
+fi
 
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
@@ -55,48 +104,48 @@ here=$(cd -- "$(dirname -- "$0")" && pwd)
 proxy="$here/imp-proxy"
 [ -x "$proxy" ] || proxy=imp-proxy
 
-# Two things are wanted from the arguments: which console to open, and a name
-# to label the tmux window with. imp-proxy does the real resolution and owns
-# every error about it, so a failure to work either out is not fatal here.
-sprite=""
-host=""
-prev=""
-for arg in "$@"; do
-  case "$prev" in
-    -s|--sprite) sprite="$arg" ;;
-    -H|--host)   host="$arg" ;;
+# What the arguments meant, from the program that defines them. Its stderr is
+# left alone, so a bad option is reported by imp-proxy in imp-proxy's words --
+# and its exit status is ours. ("unrecognized arguments: --print-console"
+# here means an imp-proxy older than this imp is first on PATH.)
+meta=$("$proxy" --print-console "$@") || exit $?
+
+# Not a console spec. `--help` among the arguments is how that happens --
+# argparse prints and exits before --print-console is ever looked at -- so
+# hand whatever it said straight on rather than inventing an error about it.
+case "$meta" in
+  *mode=*) ;;
+  *) printf '%s\n' "$meta"; exit 0 ;;
+esac
+
+mode=""; label=""; consoles=""; console=""
+while IFS= read -r line; do
+  case "$line" in
+    mode=*)     mode=${line#mode=} ;;
+    label=*)    label=${line#label=} ;;
+    consoles=*) consoles=${line#consoles=} ;;
+    console=*)  console=${line#console=} ;;
   esac
-  prev="$arg"
-done
+done <<EOF
+$meta
+EOF
+[ -n "$console" ] && [ -n "$label" ] && [ -n "$consoles" ] \
+  || die "imp-proxy did not say what to open"
 
-if [ -n "$host" ]; then
-  console="ssh -t $(printf '%q' "$host")"
-  name="$host"
-elif [ -n "$sprite" ]; then
-  console="sprite console -s $(printf '%q' "$sprite")"
-  name="$sprite"
-else
-  # No -s: plain `sprite console`, so the CLI resolves .sprite by its own
-  # rules rather than by ours. .sprite is read here for the window label and
-  # nothing else -- if the two ever disagree about which file counts, the
-  # label is the harmless place for that to show up.
-  console="sprite console"
-  [ -r .sprite ] && read -r sprite < .sprite
-  name="${sprite:-sprite}"
-fi
-label=${name//[^A-Za-z0-9_-]/-}
-
-# --clear is not a session, so it gets no window -- it clears and exits.
-for arg in "$@"; do
-  [ "$arg" = --clear ] || continue
-  exec "$proxy" "$@"
-done
+# --clear and anything else that is not a session gets no windows -- it runs
+# and exits.
+[ "$mode" = session ] || exec "$proxy" "$@"
 
 if ! command -v tmux >/dev/null 2>&1; then
   printf 'imp: no tmux -- running the proxy here.\n' >&2
-  printf 'imp: open a console elsewhere with: sprite console\n' >&2
+  printf 'imp: open consoles elsewhere with: %s\n' "$console" >&2
   exec "$proxy" "$@"
 fi
+
+# The proxy signals through a file rather than the log, and imp waits on it
+# before starting `claude` anywhere. See --ready-file in imp-proxy.
+ready_dir=$(mktemp -d "${TMPDIR:-/tmp}/imp.XXXXXX")
+ready="$ready_dir/ready"
 
 # tmux wants one command string, so the passthrough has to survive being
 # re-parsed by a shell. printf %q is what makes that safe rather than hopeful.
@@ -104,36 +153,103 @@ cmd=$(printf '%q' "$proxy")
 for arg in "$@"; do
   cmd="$cmd $(printf '%q' "$arg")"
 done
+cmd="$cmd --ready-file $(printf '%q' "$ready")"
 
+# The proxy takes the first window; the consoles follow it, so the `claude:`
+# windows are contiguous and the proxy is the one thing Ctrl-B C-n has to
+# step over. (Which index that is depends on your base-index, so nothing
+# below counts windows -- it goes by name.)
 if [ -n "${TMUX:-}" ]; then
-  win=$(tmux new-window -P -F '#{window_id}' -n "imp:$label" "$console")
+  win=$(tmux new-window -P -F '#{window_id}' \
+        -n "imp:$label" "$cmd") || die "tmux could not open a window"
   attach=""
 else
   session="imp-$label"
   if ! win=$(tmux new-session -d -s "$session" -P -F '#{window_id}' \
-             -n "imp:$label" "$console" 2>/dev/null); then
+             -n "imp:$label" "$cmd" 2>/dev/null); then
     die "tmux session '$session' already exists -- try: tmux attach -t $session"
   fi
   attach="$session"
 fi
-
-# -d keeps the cursor in the console; the proxy is there to be read, not typed
-# into. Three lines rather than the eight its startup banner wants: the banner
-# is read once, and the console pays those five lines for the rest of the
-# session. What you actually watch this pane for -- `rejected:`, an upstream
-# 401 -- scrolls past fine in three, and `ready` is the banner's second-to-last
-# line, so it still lands in view.
-pane=$(tmux split-window -v -l 3 -d -t "$win" -P -F '#{pane_id}' "$cmd")
+[ -n "$win" ] || die "tmux did not name the window it opened"
 
 # `failed`, not `on`. Ctrl-C is imp-proxy's clean exit -- it tears down and
-# returns 0 -- so the pane closes with it and you are left with the console,
-# which is the whole shape of revoking. A proxy that dies for a reason exits
-# non-zero and its pane stays put with the reason still on screen.
+# returns 0 -- so the window closes with it and you are left with the
+# consoles, which is the whole shape of revoking. A proxy that dies for a
+# reason exits non-zero and its window stays put, reason still on screen.
 #
 # Pane options need tmux 3.0 and the `failed` value 3.2; older tmux falls back
 # to keeping every dead pane, and older still does without.
-tmux set-option -p -t "$pane" remain-on-exit failed 2>/dev/null \
-  || tmux set-option -p -t "$pane" remain-on-exit on 2>/dev/null \
+tmux set-option -p -t "$win" remain-on-exit failed 2>/dev/null \
+  || tmux set-option -p -t "$win" remain-on-exit on 2>/dev/null \
   || true
+
+# The consoles. All share one window name: the reaper counts them by it, and
+# Ctrl-B C-n tells them from the proxy by it, so it is load-bearing. -n turns
+# automatic-rename off by itself, but say so anyway -- a shell that sets the
+# title would otherwise quietly rename a window out of both mechanisms.
+panes=""
+i=0
+while [ "$i" -lt "$consoles" ]; do
+  i=$((i + 1))
+  p=$(tmux new-window -a -t "$win" -P -F '#{pane_id}' \
+      -n "claude:$label" "$console") || die "tmux could not open console $i"
+  tmux set-option -w -t "$p" automatic-rename off 2>/dev/null || true
+  panes="$panes $p"
+done
+
+# Land on the first console rather than the proxy: the proxy is there to be
+# read, not typed into, and this is a working session.
+tmux select-window -t "$win" 2>/dev/null || true
+tmux select-window -t :+ 2>/dev/null || true
+
+# Ctrl-B C-n / C-p: step one window, and step again if that landed on the
+# proxy. Both keys are unbound in tmux's default prefix table. Bindings are
+# server-global -- there is no session-local key table -- so this is written
+# to be harmless in your other sessions: it is next-window/previous-window
+# that happens to skip windows named `imp:*`, and nothing else has that name.
+# The whole chain has to arrive as one argument. A bare `;` between them is
+# read by tmux as the separator between two *top-level* commands, so
+# `bind-key ... select-window ; if-shell ...` binds only the select-window
+# and runs the if-shell once, immediately, at bind time -- a binding that
+# looks right in list-keys until you notice it is half as long as it should
+# be, and lands on the proxy every third press.
+for k in 'C-n :+' 'C-p :-'; do
+  key=${k%% *}; step=${k##* }
+  tmux bind-key -T prefix "$key" \
+    "select-window -t $step ; if-shell -F '#{m:imp:*,#{window_name}}' 'select-window -t $step'" \
+    2>/dev/null || true
+done
+
+# When the last console closes, take the proxy down with it. Ctrl-C in the
+# proxy window is the other direction and must not trigger this, which is why
+# the reaper counts `claude:` windows rather than watching any single pane.
+#
+# Single quotes for tmux, double quotes for the shell inside them, so a
+# checkout path with a space in it survives both parsers.
+tmux set-hook -t "$win" window-unlinked \
+  "run-shell -b '\"$here/imp\" --reap $label $win'" 2>/dev/null || true
+
+# `claude` last, and only once the proxy says the far side is funded: it reads
+# settings.json at startup, and imp-proxy is still writing it for the first
+# second or two. Backgrounded so the attach below is immediate -- you get the
+# session while this is still waiting, and watch `claude` start in each
+# window. Typed in rather than run as the console's command because
+# `sprite console` takes no command to run.
+(
+  n=0
+  while [ ! -e "$ready" ] && [ "$n" -lt 600 ]; do
+    sleep 0.2
+    n=$((n + 1))
+    # Nothing to wait for if the proxy is already gone.
+    tmux list-windows -t "$win" >/dev/null 2>&1 || break
+  done
+  if [ -e "$ready" ]; then
+    for p in $panes; do
+      tmux send-keys -t "$p" 'claude' Enter 2>/dev/null || true
+    done
+  fi
+  rm -rf "$ready_dir"
+) >/dev/null 2>&1 &
 
 [ -z "$attach" ] || exec tmux attach -t "$attach"

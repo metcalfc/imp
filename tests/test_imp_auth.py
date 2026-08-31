@@ -19,7 +19,8 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IMP_AUTH = os.path.join(ROOT, "imp-auth")
-SOURCE = open(IMP_AUTH).read()
+with open(IMP_AUTH) as _f:
+    SOURCE = _f.read()
 
 
 def extract_heredoc(tag):

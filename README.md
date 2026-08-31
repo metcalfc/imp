@@ -9,11 +9,34 @@ your Claude Max subscription without ever giving it the credential.
 imp -s my-sprite
 ```
 
-A tmux window: a console on the sprite above, the proxy's log in a strip
-below. `claude` there now runs on your Max subscription. Ctrl-C the lower pane
-and access dies instantly — the pane goes with it, leaving the console you
-were working in, now unfunded. Closing the window revokes too. The sprite
-never held anything worth stealing.
+A tmux session, laid out for working in more than one Claude at once:
+
+```
+window 0  imp:my-sprite      the proxy, and its log
+window 1  claude:my-sprite   a console on the sprite, `claude` running in it
+window 2  claude:my-sprite
+window 3  claude:my-sprite
+```
+
+All three run on your Max subscription. `claude` starts in each one only once
+the proxy reports ready — it reads `settings.json` at startup, and that is
+what the proxy spends the first second or two writing.
+
+| | |
+|---|---|
+| `Ctrl-B n` | next window, the proxy included |
+| `Ctrl-B C-n` | next **claude** window, stepping over the proxy (`C-p` back) |
+
+Ctrl-C the proxy window and access dies instantly — the window goes with it,
+leaving the consoles you were working in, now unfunded. Closing the last
+console revokes too, and ends the session. The sprite never held anything
+worth stealing.
+
+`-n` changes how many consoles you get:
+
+```
+imp -s my-sprite -n 5
+```
 
 `imp` is only sugar for two commands you could type yourself. The one that
 matters is `imp-proxy`, which needs no tmux and is a Ctrl-C away as it always
@@ -52,7 +75,7 @@ purpose, not because it arrived on your `PATH` alongside something else.
 
 | | |
 |---|---|
-| `imp` | opens the tmux window. Sugar; passes every option through |
+| `imp` | lays out the tmux session. Sugar; passes every option through |
 | `imp-proxy` | the whole of it — the credential, the tunnel, the allowlist |
 | `imp-auth` | mints and stores the token `imp-proxy` reads |
 
@@ -60,7 +83,7 @@ Or run them straight out of the clone — `./imp -s my-sprite` works the same,
 and picks up the `imp-proxy` sitting next to it rather than one on your `PATH`.
 
 You need `python3` and the [`sprite` CLI](https://docs.sprites.dev) on your
-machine, `tmux` only if you want the window, `python3` on the sprite, and a
+machine, `tmux` only if you want the windows, `python3` on the sprite, and a
 Claude Max subscription. Nothing is installed on the sprite: the relay is
 shipped as base64 in argv and never touches its disk.
 
@@ -244,8 +267,9 @@ Verified against a live sprite:
 | `claude -p` through the tunnel | `TUNNEL_OK` — incl. an 83KB request |
 | Ctrl-C, then `claude` on the sprite | `Not logged in · Please run /login` |
 | clean exit teardown | `NO ENV BLOCK` — settings.json restored |
-| closing the terminal or the tmux pane (SIGHUP) | same as a clean exit — settings.json restored |
-| Ctrl-C in the proxy pane | teardown runs, exit 0, and the pane closes itself — a pane that stays is one that failed |
+| closing the terminal or the tmux window (SIGHUP) | same as a clean exit — settings.json restored |
+| Ctrl-C in the proxy window | teardown runs, exit 0, and the window closes itself — a window that stays is one that failed |
+| closing the last `claude:` window | the proxy window is killed with it, and tears down the same way |
 
 And against a real ssh host (`-H`, Linux, OpenSSH client, Go server):
 
@@ -479,6 +503,8 @@ imp-proxy [-s SPRITE | -H HOST] [-p REMOTE_PORT] [--no-settings]
       --allow-any-path  disable the allowlist entirely
       --clear         remove the far side's ANTHROPIC_* pointer, whoever left
                       it, and say whether anything is still behind it
+  -n, --consoles      how many console windows `imp` should open (default 3);
+                      imp-proxy opens no windows itself and ignores it
   -v, --verbose       log each proxied request (method, path, size)
 ```
 
@@ -490,7 +516,17 @@ Stdlib only, no fixtures to install, no sprite required:
 python3 -m unittest discover -s tests -v
 ```
 
-They cover the parts the security claims rest on. The path allowlist and
+`imp` has its own file. It used to have none — it was written off as "a
+launcher with nothing at stake" — while it re-implemented argparse's grammar
+in bash to decide which console to open, and got every spelling wrong except
+the one that got typed by hand: `-sNAME`, `--sprite=NAME` and `--spr NAME`
+all reached imp-proxy intact and funded one machine while imp opened a
+console on another. It now asks imp-proxy what the arguments meant, and the
+tests pin that down along with the window layout, the readiness gate before
+`claude` starts, and both directions a session can end. The tmux ones drive a
+real tmux on a private socket, and skip themselves where it is missing.
+
+The rest cover the parts the security claims rest on. The path allowlist and
 target normalization are exercised directly and over the wire, including
 `/v1/messages/../../v1/organizations`. A stand-in upstream records exactly what
 crossed the boundary, so "the capability never reaches Anthropic" and "the real

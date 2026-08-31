@@ -3,24 +3,28 @@
 The interesting claims imp-proxy makes are security claims: the sprite's
 capability is not a credential, the path allowlist holds before the real token
 is attached, and the framed tunnel is 8-bit clean. Those are what is tested
-here. `imp` itself is a launcher with nothing at stake; shellcheck covers it.
+here. `imp` has its own file; it turned out to have plenty at stake.
 
 Stdlib only, matching the tool itself. Run: python3 -m unittest discover tests
 """
 
 import base64
+import http.client
 import importlib.util
 import io
 import json
 import os
+import shutil
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import (BaseHTTPRequestHandler, HTTPServer,
+                         ThreadingHTTPServer)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -201,6 +205,12 @@ class FakeUpstream(object):
 
     def __init__(self):
         self.requests = []          # (method, path, headers dict, body bytes)
+        # Connections, not requests. Keep-alive is only observable as the
+        # difference between the two.
+        self.connections = 0
+        self.live_connections = 0
+        self.sockets = []
+        self.lock = threading.Lock()
         self.status = 200
         self.body = b'{"ok":true}'
         self.sse = None             # list of chunks to stream instead
@@ -212,6 +222,18 @@ class FakeUpstream(object):
 
             def log_message(self, *a):
                 pass
+
+            def setup(self):
+                BaseHTTPRequestHandler.setup(self)
+                with outer.lock:
+                    outer.connections += 1
+                    outer.live_connections += 1
+                    outer.sockets.append(self.connection)
+
+            def finish(self):
+                BaseHTTPRequestHandler.finish(self)
+                with outer.lock:
+                    outer.live_connections -= 1
 
             def _handle(self):
                 n = int(self.headers.get("Content-Length") or 0)
@@ -251,13 +273,35 @@ class FakeUpstream(object):
 
             do_GET = do_POST = do_PUT = do_DELETE = _handle
 
-        self.server = HTTPServer(("127.0.0.1", 0), H)
+        # Threaded: a kept-alive connection occupies its handler until the
+        # client lets go, and a single-threaded server would then accept
+        # nothing else for the rest of the test.
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     @property
     def url(self):
         return "http://127.0.0.1:%d" % self.port
+
+    def drop_idle(self):
+        """Close our end of every connection, saying nothing.
+
+        This is the far end hanging up on an idle keep-alive connection --
+        which it may do at any time, and which the proxy only finds out about
+        by trying to use it.
+        """
+        with self.lock:
+            socks, self.sockets = self.sockets, []
+        for sk in socks:
+            try:
+                sk.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sk.close()
+            except OSError:
+                pass
 
     def close(self):
         self.server.shutdown()
@@ -617,7 +661,13 @@ class TestResourceBounds(ProxyTestCase):
 
 class TestNoRedirect(ProxyTestCase):
     def test_a_redirect_is_passed_back_and_not_followed(self):
-        """urllib's default handler copies Authorization across origins."""
+        """A 3xx must never carry the real token to the host it names.
+
+        urllib's default handler copied Authorization across origins, so
+        refusing took a subclass. http.client does not follow redirects at
+        all -- the same guarantee with nothing left to get wrong. The claim
+        is about the token either way, so it is tested the same way.
+        """
         followed = []
 
         class Redirector(BaseHTTPRequestHandler):
@@ -1287,6 +1337,314 @@ class TestHopHeaders(unittest.TestCase):
     def test_hop_by_hop_headers_are_not_forwarded(self):
         for h in ("connection", "transfer-encoding", "content-length", "host"):
             self.assertIn(h, imp.HOP)
+
+
+# --------------------------------------------------------------------------
+# header case, which a dict does not handle for you
+# --------------------------------------------------------------------------
+
+class TestHeaderCase(ProxyTestCase):
+    """Header names are case-insensitive; the dict they were kept in was not.
+
+    The proxy looks headers up by name in several places. With the sprite's
+    spelling preserved, `Anthropic-Beta` and `anthropic-beta` were two keys,
+    and urllib then collapsed them on the way out -- silently dropping
+    whichever it did not pick.
+    """
+
+    def test_an_oddly_cased_beta_header_is_merged_not_dropped(self):
+        self.start()
+        self.request(headers={"Anthropic-Beta": "fine-grained-tool-streaming-2025-05-14"})
+        sent = self.upstream.requests[0][2].get("anthropic-beta")
+        self.assertIn("fine-grained-tool-streaming-2025-05-14", sent)
+        for b in imp.REQUIRED_BETAS:
+            self.assertIn(b, sent)
+
+    def test_only_one_beta_header_reaches_upstream(self):
+        self.start()
+        self.request(headers={"Anthropic-Beta": "x-beta"})
+        names = [n.lower() for n in self.upstream.requests[0][2].original_names]
+        self.assertEqual(names.count("anthropic-beta"), 1)
+
+    def test_an_oddly_cased_capability_is_accepted(self):
+        self.start()
+        status, _, _ = self.request(auth=False,
+                                    headers={"AUTHORIZATION": "Bearer " + CAPABILITY})
+        self.assertEqual(status, 200)
+
+    def test_no_cased_credential_header_survives_the_hop(self):
+        self.start()
+        self.request(headers={"X-Api-Key": CAPABILITY,
+                              "x-api-key": CAPABILITY})
+        hdrs = self.upstream.requests[0][2]
+        self.assertIsNone(hdrs.get("x-api-key"))
+        self.assertEqual(hdrs.get("authorization"), "Bearer " + self.cred.token)
+
+
+# --------------------------------------------------------------------------
+# the kept upstream connection
+# --------------------------------------------------------------------------
+
+class KeepAliveClient(object):
+    """One client connection, several requests -- the way `claude` talks.
+
+    The proxy keeps one upstream connection per handler thread, and a handler
+    thread is one client connection. Reuse is therefore only reachable by a
+    client that holds its connection open, which the ProxyTestCase.request
+    helper deliberately does not.
+    """
+
+    def __init__(self, port):
+        self.conn = socket.create_connection(("127.0.0.1", port), timeout=10)
+
+    def request(self, path="/v1/messages", body=b'{"model":"x"}'):
+        raw = ("POST %s HTTP/1.1\r\n" % path).encode()
+        raw += b"Host: api.anthropic.com\r\n"
+        raw += ("Authorization: Bearer %s\r\n" % CAPABILITY).encode()
+        raw += ("Content-Length: %d\r\n\r\n" % len(body)).encode()
+        self.conn.sendall(raw + body)
+        got = b""
+        while not got.endswith(b"0\r\n\r\n"):
+            chunk = self.conn.recv(65536)
+            if not chunk:
+                break
+            got += chunk
+        head = got.split(b"\r\n\r\n", 1)[0]
+        return int(head.split(b"\r\n")[0].split()[1])
+
+    def close(self):
+        try:
+            self.conn.close()
+        except OSError:
+            pass
+
+
+class TestUpstreamKeepAlive(ProxyTestCase):
+    """A fresh TLS handshake per request was most of what imp added to the
+    latency of talking to the API directly."""
+
+    def wait(self, pred, timeout=5.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            if pred():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_several_requests_share_one_upstream_connection(self):
+        self.start()
+        c = KeepAliveClient(self.port)
+        try:
+            for _ in range(3):
+                self.assertEqual(c.request(), 200)
+        finally:
+            c.close()
+        self.assertEqual(len(self.upstream.requests), 3)
+        self.assertEqual(self.upstream.connections, 1,
+                         "opened a new upstream connection per request")
+
+    def test_separate_clients_do_not_share_a_connection(self):
+        # Thread-local, so there is nothing to leak between two sprites'
+        # conversations even though the credential is the same.
+        self.start()
+        for _ in range(2):
+            self.assertEqual(self.request()[0], 200)
+        self.assertEqual(self.upstream.connections, 2)
+
+    def test_the_connection_closes_when_the_client_goes_away(self):
+        self.start()
+        c = KeepAliveClient(self.port)
+        self.assertEqual(c.request(), 200)
+        c.close()
+        # The handler thread ends with the client connection, and its
+        # upstream connection must go with it rather than wait for the
+        # garbage collector -- which is where it showed up as a
+        # ResourceWarning and a socket held open indefinitely.
+        self.assertTrue(self.wait(lambda: self.upstream.live_connections == 0),
+                        "upstream connection outlived the client")
+
+    def test_a_kept_connection_the_far_end_dropped_is_retried(self):
+        self.start()
+        c = KeepAliveClient(self.port)
+        try:
+            self.assertEqual(c.request(), 200)
+            # The far end hangs up on the idle connection without saying so.
+            self.upstream.drop_idle()
+            time.sleep(0.2)
+            self.assertEqual(c.request(), 200,
+                             "a stale kept connection was not retried")
+        finally:
+            c.close()
+        self.assertEqual(len(self.upstream.requests), 2)
+        self.assertEqual(self.upstream.connections, 2)
+
+    def test_reuse_does_not_leak_the_previous_body(self):
+        self.start()
+        c = KeepAliveClient(self.port)
+        try:
+            c.request(body=b'{"first":true}')
+            c.request(body=b'{"second":true}')
+        finally:
+            c.close()
+        self.assertEqual([r[3] for r in self.upstream.requests],
+                         [b'{"first":true}', b'{"second":true}'])
+
+    def test_a_401_retry_does_not_poison_the_connection(self):
+        # The 401 body has to be drained before the connection is handed on,
+        # or the retry reads it as the head of its own response.
+        self.cred = FakeCredential(token="stale", rotate_to="fresh")
+        self.upstream.fail_until_token = "fresh"
+        self.start()
+        c = KeepAliveClient(self.port)
+        try:
+            self.assertEqual(c.request(), 200)
+            self.assertEqual(c.request(), 200)
+        finally:
+            c.close()
+
+
+class TestUpstreamConnectionChoice(unittest.TestCase):
+    """The real UPSTREAM is https; every test above points at a plain http
+    stand-in, so the scheme branch would otherwise never be looked at."""
+
+    def setUp(self):
+        self.real = imp.UPSTREAM
+
+    def tearDown(self):
+        imp.UPSTREAM = self.real
+
+    def test_https_upstream_gets_a_tls_connection(self):
+        up = imp.Upstream()
+        conn = up._open()
+        try:
+            self.assertIsInstance(conn, http.client.HTTPSConnection)
+            self.assertEqual(conn.host, "api.anthropic.com")
+        finally:
+            up.discard()
+
+    def test_plain_http_upstream_does_not(self):
+        imp.UPSTREAM = "http://127.0.0.1:9"
+        up = imp.Upstream()
+        conn = up._open()
+        try:
+            self.assertNotIsInstance(conn, http.client.HTTPSConnection)
+            self.assertIsInstance(conn, http.client.HTTPConnection)
+        finally:
+            up.discard()
+
+    def test_a_changed_upstream_is_not_answered_from_the_old_connection(self):
+        imp.UPSTREAM = "http://127.0.0.1:9"
+        up = imp.Upstream()
+        up._open()
+        first = up._local.conn
+        imp.UPSTREAM = "http://127.0.0.1:10"
+        # send() drops a kept connection whose target no longer matches; the
+        # attempt fails on a closed port, which is what we want to see -- the
+        # point is that it is not the old connection that failed.
+        resp, err = up.send("GET", "/v1/models", None, {})
+        self.assertIsNotNone(err)
+        self.assertIsNot(up._local.conn, first)
+        up.discard()
+
+
+class TestCredentialRefreshIsContained(unittest.TestCase):
+    def test_an_unreadable_credential_does_not_escape_refresh(self):
+        """It used to catch only SystemExit, so an OSError from the keychain
+        or a half-written credentials file reached the handler thread and the
+        sprite got a dropped connection where a 401 was the answer."""
+        real = imp.load_credential
+        imp.load_credential = lambda: ("tok", "test")
+        try:
+            cred = imp.Credential()
+        finally:
+            imp.load_credential = real
+
+        def boom():
+            raise OSError(13, "Permission denied")
+
+        imp.load_credential = boom
+        try:
+            self.assertFalse(cred.refresh())
+        finally:
+            imp.load_credential = real
+        self.assertEqual(cred.token, "tok")
+
+    def test_no_credential_at_all_is_also_contained(self):
+        real = imp.load_credential
+        imp.load_credential = lambda: ("tok", "test")
+        try:
+            cred = imp.Credential()
+        finally:
+            imp.load_credential = real
+
+        def gone():
+            raise SystemExit("no Claude credential found")
+
+        imp.load_credential = gone
+        try:
+            self.assertFalse(cred.refresh())
+        finally:
+            imp.load_credential = real
+
+
+class TestArgumentValidation(unittest.TestCase):
+    def test_a_port_outside_the_range_is_refused(self):
+        for bad in ("0", "65536", "99999", "-1", "eight"):
+            self.assertRaises(Exception, imp.port_arg, bad)
+
+    def test_a_real_port_is_accepted(self):
+        self.assertEqual(imp.port_arg("8080"), 8080)
+
+    def test_console_count_is_bounded(self):
+        self.assertEqual(imp.consoles_arg("3"), 3)
+        for bad in ("0", "33", "-1", "many"):
+            self.assertRaises(Exception, imp.consoles_arg, bad)
+
+
+class TestReadyFile(unittest.TestCase):
+    """The signal `imp` waits on before starting `claude`."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="imp-ready.")
+        self.path = os.path.join(self.dir, "ready")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_it_is_written_and_removed(self):
+        imp.set_ready(self.path, True)
+        self.assertTrue(os.path.exists(self.path))
+        imp.set_ready(self.path, False)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_no_path_is_not_an_error(self):
+        imp.set_ready("", True)
+        imp.set_ready("", False)
+
+    def test_removing_one_that_is_already_gone_is_not_an_error(self):
+        imp.set_ready(self.path, False)
+
+    def test_an_unwritable_location_does_not_take_the_session_down(self):
+        imp.set_ready(os.path.join(self.dir, "nope", "ready"), True)
+
+
+class TestConsoleArgv(unittest.TestCase):
+    def test_a_sprite_console_names_the_sprite(self):
+        self.assertEqual(imp.SpriteTarget("foo").console_argv(),
+                         ["sprite", "console", "-s", "foo"])
+
+    def test_an_ambient_sprite_console_names_nothing(self):
+        self.assertEqual(imp.SpriteTarget("").console_argv(),
+                         ["sprite", "console"])
+
+    def test_an_ssh_console_asks_for_a_tty(self):
+        # Without -t there is no prompt, no job control and no `claude`.
+        self.assertEqual(imp.SSHTarget("box").console_argv(),
+                         ["ssh", "-t", "box"])
+
+    def test_a_label_is_safe_to_hand_to_tmux(self):
+        self.assertEqual(imp.tmux_label("we ird/name"), "we-ird-name")
+        self.assertEqual(imp.tmux_label(""), "sprite")
 
 
 if __name__ == "__main__":
