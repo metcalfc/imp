@@ -166,7 +166,13 @@ class Harness(object):
             if "\t" not in line:
                 continue
             name, cmd = line.split("\t", 1)
-            out.append((name, cmd.strip().strip('"')))
+            cmd = cmd.strip().strip('"')
+            # imp prefixes every pane command with `exec` so the pane's
+            # process is the real one; that is plumbing, not part of what the
+            # arguments asked for, so it comes off here.
+            if cmd.startswith("exec "):
+                cmd = cmd[len("exec "):]
+            out.append((name, cmd))
         return out
 
     # -- imp -------------------------------------------------------------

@@ -149,7 +149,16 @@ ready="$ready_dir/ready"
 
 # tmux wants one command string, so the passthrough has to survive being
 # re-parsed by a shell. printf %q is what makes that safe rather than hopeful.
-cmd=$(printf '%q' "$proxy")
+#
+# `exec`, and it is load-bearing. tmux runs a pane's command through a shell,
+# and whether that shell replaces itself with the command or sits in front of
+# it as a parent is the shell's business, not ours: bash and zsh exec, dash
+# does not. When it does not, Ctrl-C kills the *shell* -- tmux reports "Pane
+# is dead (signal 2)", which remain-on-exit=failed rightly treats as a
+# failure -- so the proxy tore down cleanly and its window stayed open
+# anyway, wearing a dead pane. exec makes the pane process imp-proxy
+# everywhere, so the signal and the exit status are always its own.
+cmd="exec $(printf '%q' "$proxy")"
 for arg in "$@"; do
   cmd="$cmd $(printf '%q' "$arg")"
 done
@@ -192,8 +201,10 @@ panes=""
 i=0
 while [ "$i" -lt "$consoles" ]; do
   i=$((i + 1))
+  # exec, for the same reason as the proxy: leaving the console should be
+  # the console's exit status, not a wrapper shell's.
   p=$(tmux new-window -a -t "$win" -P -F '#{pane_id}' \
-      -n "claude:$label" "$console") || die "tmux could not open console $i"
+      -n "claude:$label" "exec $console") || die "tmux could not open console $i"
   tmux set-option -w -t "$p" automatic-rename off 2>/dev/null || true
   panes="$panes $p"
 done
