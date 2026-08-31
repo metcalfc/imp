@@ -238,6 +238,14 @@ class TestArgumentSpellings(unittest.TestCase):
         # over ssh and opened a console on whatever .sprite said.
         self.assertNotIn("sprite", self.console("--host=box")["console"])
 
+    def test_reattach_is_reported_in_the_console_spec(self):
+        # `imp` does not parse argv; every question it asks about the
+        # arguments is answered here, and "is this a session to build or one
+        # to rejoin" is one of them.
+        self.assertEqual(self.console("-s", "foo")["reattach"], "0")
+        self.assertEqual(self.console("-s", "foo", "--reattach")["reattach"],
+                         "1")
+
     def test_clear_is_not_a_session(self):
         self.assertEqual(self.console("--clear", "-s", "foo")["mode"],
                          "oneshot")
@@ -456,6 +464,94 @@ class TestEndingASession(TmuxCase):
         self.assertTrue(self.h.wait(
             lambda: "imp:foo" not in self.h.windows()))
         self.assertEqual(self.h.windows(), ["claude:foo"] * 3)
+
+
+class TestReattach(TmuxCase):
+    """Putting the proxy back beside consoles that outlived it.
+
+    The expensive half of a session is the consoles -- three claudes with
+    three conversations in them -- so what is checked here is mostly what
+    --reattach does *not* do: it opens no console, types no `claude`, and
+    leaves the ones that are running exactly where they were.
+    """
+
+    def revoke(self):
+        """Ctrl-C in the proxy window, which is how a session loses it."""
+        self.h.tmux("send-keys", "-t", self.h.proxy_window(), "C-c")
+        self.assertTrue(self.h.wait(
+            lambda: "imp:foo" not in self.h.windows()))
+
+    def setUp(self):
+        TmuxCase.setUp(self)
+        self.h.imp("-s", "foo")
+        self.assertTrue(self.h.wait(lambda: len(self.h.windows()) == 4))
+        first = self.h.consoles()[0]
+        self.assertTrue(self.h.wait(
+            lambda: "CLAUDE RUNNING" in self.h.pane_text(first)))
+        self.before = self.h.consoles()
+
+    def test_the_proxy_comes_back_in_front_of_the_consoles_it_left(self):
+        self.revoke()
+        self.h.imp("-s", "foo", "--reattach")
+        self.assertTrue(self.h.wait(lambda: len(self.h.windows()) == 4))
+        self.assertEqual(self.h.windows(),
+                         ["imp:foo", "claude:foo", "claude:foo", "claude:foo"])
+
+    def test_the_consoles_are_the_same_ones(self):
+        # Not "three consoles again" -- the same three windows, still holding
+        # whatever was in them. Ids, because that is the difference.
+        self.revoke()
+        self.h.imp("-s", "foo", "--reattach")
+        self.assertTrue(self.h.wait(lambda: self.h.proxy_window()))
+        self.assertEqual(self.h.consoles(), self.before)
+
+    def test_the_proxy_is_told_to_reattach_and_waits_for_nothing(self):
+        self.revoke()
+        self.h.imp("-s", "foo", "--reattach")
+        self.assertTrue(self.h.wait(lambda: self.h.proxy_window()))
+        cmds = [c for n, c in self.h.start_commands() if n == "imp:foo"]
+        self.assertEqual(len(cmds), 1)
+        self.assertIn("--reattach", cmds[0])
+        # No readiness gate: nothing is waiting to type `claude` anywhere.
+        self.assertNotIn("--ready-file", cmds[0])
+
+    def test_claude_is_not_typed_into_a_console_again(self):
+        self.revoke()
+        # A console at its shell prompt is the shape a stray `claude` would
+        # arrive in; this one is running the stub, so a second line would be
+        # a second CLAUDE RUNNING.
+        self.h.imp("-s", "foo", "--reattach")
+        self.assertTrue(self.h.wait(lambda: self.h.proxy_window()))
+        self.assertTrue(self.h.wait(
+            lambda: "PROXY UP" in self.h.pane_text(self.h.proxy_window())))
+        for wid in self.before:
+            self.assertEqual(self.h.pane_text(wid).count("CLAUDE RUNNING"), 1,
+                             "claude was started twice in %s" % wid)
+
+    def test_the_reaper_is_armed_again(self):
+        # A reattached session that had lost its hook would sit there funding
+        # nothing after its last console closed.
+        self.revoke()
+        self.h.imp("-s", "foo", "--reattach")
+        self.assertTrue(self.h.wait(lambda: self.h.proxy_window()))
+        for wid in self.h.consoles():
+            self.h.tmux("kill-window", "-t", wid)
+            time.sleep(0.3)
+        self.assertTrue(self.h.wait(lambda: self.h.windows() == []),
+                        "session outlived its last console: %r"
+                        % (self.h.windows(),))
+
+    def test_reattaching_to_a_session_that_still_has_its_proxy_says_so(self):
+        r = self.h.imp("-s", "foo", "--reattach")
+        self.assertIn("already has a proxy window", r.stderr)
+        self.assertEqual(self.h.windows().count("imp:foo"), 1)
+
+    def test_reattaching_to_nothing_names_the_command_that_builds_one(self):
+        r = self.h.imp("-s", "bar", "--reattach")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no session 'imp-bar'", r.stderr)
+        self.assertIn("imp -s bar", r.stderr)
+        self.assertEqual(self.h.windows("imp-bar"), [])
 
 
 class TestKeyBindings(TmuxCase):

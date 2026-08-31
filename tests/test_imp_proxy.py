@@ -1628,6 +1628,110 @@ class TestReadyFile(unittest.TestCase):
         imp.set_ready(os.path.join(self.dir, "nope", "ready"), True)
 
 
+class TestSessionState(unittest.TestCase):
+    """The capability, written down so that a Ctrl-C can be undone.
+
+    What --reattach buys is that the `claude` processes on the far side are
+    funded again without being restarted, and that only works if the proxy
+    that comes back offers the same string they read at startup. So: it comes
+    back, it comes back keyed to the right session, and it does not come back
+    when what is on disk is stale or was never one of ours.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="imp-state.")
+        self.saved = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = self.dir
+        self.target = imp.SpriteTarget("foo")
+
+    def tearDown(self):
+        if self.saved is None:
+            os.environ.pop("XDG_STATE_HOME", None)
+        else:
+            os.environ["XDG_STATE_HOME"] = self.saved
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_what_was_saved_is_what_comes_back(self):
+        cap = imp.new_capability()
+        imp.save_capability(self.target, 8080, cap)
+        got, why = imp.load_capability(self.target, 8080)
+        self.assertEqual(got, cap)
+        self.assertEqual(why, "")
+
+    def test_a_port_is_part_of_which_session_this_is(self):
+        # Two proxies against one host on two ports fund two sets of
+        # consoles; handing one's capability back to the other funds neither.
+        imp.save_capability(self.target, 8080, "a" * imp.CAPABILITY_LEN)
+        imp.save_capability(self.target, 9090, "b" * imp.CAPABILITY_LEN)
+        self.assertEqual(imp.load_capability(self.target, 8080)[0],
+                         "a" * imp.CAPABILITY_LEN)
+        self.assertEqual(imp.load_capability(self.target, 9090)[0],
+                         "b" * imp.CAPABILITY_LEN)
+
+    def test_a_host_is_too(self):
+        imp.save_capability(self.target, 8080, "a" * imp.CAPABILITY_LEN)
+        cap, why = imp.load_capability(imp.SSHTarget("box"), 8080)
+        self.assertIsNone(cap)
+        self.assertIn("box", why)
+
+    def test_nothing_written_down_is_a_reason_and_not_a_crash(self):
+        cap, why = imp.load_capability(self.target, 8080)
+        self.assertIsNone(cap)
+        self.assertIn("foo", why)
+
+    def test_a_stale_session_is_not_reattached_to(self):
+        # Nothing that old is still holding it, and offering it anyway would
+        # put a capability back on the far side for no one.
+        imp.save_capability(self.target, 8080, "c" * imp.CAPABILITY_LEN)
+        path = imp.state_path(self.target, 8080)
+        with open(path) as f:
+            rec = json.load(f)
+        rec["written"] = int(time.time() - imp.STATE_TTL - 60)
+        with open(path, "w") as f:
+            json.dump(rec, f)
+        cap, why = imp.load_capability(self.target, 8080)
+        self.assertIsNone(cap)
+        self.assertIn("hours ago", why)
+
+    def test_something_that_is_not_a_capability_is_refused(self):
+        # The case that matters: a file edited to hold a real key would
+        # otherwise be installed on the far side as one, which is the single
+        # thing this program exists not to do.
+        path = imp.state_path(self.target, 8080)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"capability": "sk-ant-oat01-not-a-capability",
+                       "written": int(time.time())}, f)
+        cap, why = imp.load_capability(self.target, 8080)
+        self.assertIsNone(cap)
+        self.assertIn("not a capability", why)
+
+    def test_an_unreadable_file_is_a_reason_too(self):
+        path = imp.state_path(self.target, 8080)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("{not json")
+        self.assertIsNone(imp.load_capability(self.target, 8080)[0])
+
+    def test_it_is_not_left_readable_to_the_rest_of_the_machine(self):
+        imp.save_capability(self.target, 8080, "d" * imp.CAPABILITY_LEN)
+        mode = os.stat(imp.state_path(self.target, 8080)).st_mode
+        self.assertEqual(mode & 0o077, 0)
+
+    def test_clearing_a_session_forgets_it(self):
+        imp.save_capability(self.target, 8080, "e" * imp.CAPABILITY_LEN)
+        imp.forget_capability(self.target, 8080)
+        self.assertIsNone(imp.load_capability(self.target, 8080)[0])
+        # And again, on nothing.
+        imp.forget_capability(self.target, 8080)
+
+    def test_a_place_it_cannot_write_does_not_take_the_session_down(self):
+        os.environ["XDG_STATE_HOME"] = os.path.join(self.dir, "nope", "deeper")
+        with open(os.path.join(self.dir, "nope"), "w"):
+            pass
+        imp.save_capability(self.target, 8080, "f" * imp.CAPABILITY_LEN)
+
+
 class TestConsoleArgv(unittest.TestCase):
     def test_a_sprite_console_names_the_sprite(self):
         self.assertEqual(imp.SpriteTarget("foo").console_argv(),

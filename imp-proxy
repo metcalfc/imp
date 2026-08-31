@@ -41,6 +41,7 @@ import socketserver
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -81,6 +82,7 @@ MAX_STREAMS = 256               # concurrent proxied connections
 # that pauses to render a long response is slow, not stuck -- be generous.
 MAX_STREAM_BUFFER = 8 * 1024 * 1024
 SETTINGS_TIMEOUT = 30.0         # ssh round trip for settings.json
+STATE_TTL = 24 * 3600.0         # how long a session is worth reattaching to
 
 # A long inference call streams for minutes, so the socket timeout has to be
 # generous; it exists to stop a wedged connection pinning a thread forever.
@@ -1362,6 +1364,119 @@ def tmux_label(name):
     return safe or "sprite"
 
 
+# --------------------------------------------------------------------------
+# Remembering a session, so that Ctrl-C can be an accident
+#
+# The capability is minted here and handed over once, through the far side's
+# settings.json. Stopping the proxy takes our half of that away and leaves
+# theirs -- the processes keep running, pointed at a port with nothing behind
+# it. Which is exactly what revoking should look like, and exactly what a
+# mistyped Ctrl-C looks like too.
+#
+# A running `claude` does re-read settings.json, so a fresh proxy with a
+# fresh capability is picked up by one that was already going. That is Claude
+# Code's behaviour and not ours to promise, and it is worth not depending on:
+# the capability is written down here, and --reattach hands the same one
+# back, so a proxy that comes back is a proxy the far side never noticed had
+# gone.
+# It is not a credential. It names one session, buys nothing without a proxy
+# of ours listening on the far side's port, and the far side has held it
+# since the moment it was minted. 0600 all the same, and only ever reused
+# because someone asked.
+
+def new_capability():
+    """The far side's whole share of a session: a name for it, and nothing
+    that is worth anything without a proxy of ours behind the port."""
+    return base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
+
+
+# What one looks like, taken from one rather than written down twice.
+CAPABILITY_LEN = len(new_capability())
+
+
+def state_dir():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "imp")
+
+
+def state_path(target, remote_port):
+    """One file per label per port -- keyed the way the tmux session is.
+
+    The same host on two ports is two sessions funding two sets of consoles,
+    and handing one's capability back to the other would fund neither.
+    """
+    return os.path.join(state_dir(), "%s-%d.json"
+                        % (tmux_label(target.short_label()), remote_port))
+
+
+def save_capability(target, remote_port, capability):
+    """Best effort, deliberately: a session that cannot write this is a
+    session that works, minus the ability to be reattached to."""
+    d = state_dir()
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".imp.", suffix=".tmp", dir=d)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump({"capability": capability,
+                           "port": remote_port,
+                           "target": target.label(),
+                           "written": int(time.time())}, f)
+                f.write("\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, state_path(target, remote_port))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        pass
+
+
+def load_capability(target, remote_port):
+    """The capability this target's last session used, or None and why not.
+
+    The reason is printed rather than swallowed: the difference between
+    consoles that resume and consoles that have to be restarted is the whole
+    of what --reattach promises, and it should not be something you discover
+    by watching one fail.
+    """
+    try:
+        with open(state_path(target, remote_port)) as f:
+            rec = json.load(f)
+    except (IOError, OSError):
+        return None, ("no earlier session on %s port %d was written down"
+                      % (target.label(), remote_port))
+    except ValueError:
+        return None, "what was written down is not readable"
+    cap = rec.get("capability") or ""
+    # Shaped like something we minted. A file someone has edited to hold a
+    # real ANTHROPIC_API_KEY is the case worth refusing outright: it would
+    # otherwise be installed on the far side as a capability, which is the
+    # one thing this program exists not to do.
+    if not re.match(r"\A[A-Za-z0-9_-]{%d}\Z" % CAPABILITY_LEN, cap):
+        return None, "what was written down is not a capability of ours"
+    age = time.time() - rec.get("written", 0)
+    if age > STATE_TTL:
+        return None, ("the last session there ended %.0f hours ago"
+                      % (age / 3600.0))
+    return cap, ""
+
+
+def forget_capability(target, remote_port):
+    """--clear ends a session, and this is the part of one that lives here.
+
+    A pointer that has been taken out is not something to reattach to; the
+    consoles it funded are gone or unfunded either way.
+    """
+    try:
+        os.remove(state_path(target, remote_port))
+    except OSError:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="imp-proxy",
@@ -1398,6 +1513,12 @@ def main():
                     help="how many console windows `imp` should open "
                          "(default 3). Ignored when imp-proxy is run "
                          "directly -- it opens no windows")
+    ap.add_argument("--reattach", action="store_true",
+                    help="reuse the capability the last session on this "
+                         "target held, so `claude` processes still running "
+                         "there are funded again without being restarted. "
+                         "`imp --reattach` also puts the proxy back in the "
+                         "tmux session it was killed out of")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="log each proxied request")
     # Written when the far side is actually funded, removed on the way out.
@@ -1425,6 +1546,7 @@ def main():
         # Three lines: whether this invocation is a session at all, a window
         # label, and the console command ready for a shell to re-parse.
         print("mode=%s" % ("oneshot" if args.clear else "session"))
+        print("reattach=%d" % (1 if args.reattach else 0))
         print("label=%s" % tmux_label(target.short_label()))
         print("consoles=%d" % args.consoles)
         print("console=%s" % " ".join(shlex.quote(a)
@@ -1432,11 +1554,23 @@ def main():
         return 0
 
     if args.clear:
+        forget_capability(target, args.remote_port)
         return clear_target(target)
 
     cred = Credential()
-    capability = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
+    capability = new_capability()
     log("credential loaded (%d chars) from %s" % (len(cred.token), cred.source))
+    if args.reattach:
+        prior, why = load_capability(target, args.remote_port)
+        if prior:
+            capability = prior
+            log("reattached -- reusing the capability %s already holds"
+                % target.label())
+        else:
+            log("nothing to reattach to: %s" % why)
+            log("a new capability instead -- `claude` already running there "
+                "has to be restarted to pick it up")
+    save_capability(target, args.remote_port, capability)
 
     allowed = () if args.allow_any_path else DEFAULT_ALLOWED + tuple(args.allow)
     if allowed:

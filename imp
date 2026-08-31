@@ -30,6 +30,11 @@
 # one funded one machine and opened a console on another. There is one
 # parser now, and it is argparse.
 #
+# Ctrl-C in the proxy window revokes access, which is a thing you do on
+# purpose and a thing you do by accident with three claudes still open.
+# `imp -s NAME --reattach` is the way back from the second case: a proxy
+# window back in the session, funding the consoles that are already there.
+#
 # tmux is not required. Without it this is exactly `imp-proxy`, and you open
 # consoles wherever you like.
 
@@ -39,7 +44,7 @@ die() { printf 'imp: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat >&2 <<'USAGE'
-usage: imp [-s NAME | -H HOST] [-n COUNT] [imp-proxy options...]
+usage: imp [-s NAME | -H HOST] [-n COUNT] [--reattach] [imp-proxy options...]
 
 Opens a tmux session: imp-proxy in the first window, then COUNT console
 windows (3 by default) each running `claude`. -s gets you sprite consoles,
@@ -56,6 +61,14 @@ still writing for the first second or two.
 Ctrl-C in the proxy window revokes access, exactly as it always has, and
 takes that window with it -- leaving the consoles, now unfunded. Closing the
 last claude window revokes too, and ends the session.
+
+    imp -s NAME --reattach
+
+is the way back from the first of those when you did not mean it. It puts a
+proxy window back in front of the consoles it left, in the session they are
+still sitting in, and imp-proxy hands the far side the same capability those
+claudes are already holding -- so they resume rather than restart. It opens
+no consoles and types no `claude`.
 USAGE
 }
 
@@ -118,10 +131,11 @@ case "$meta" in
   *) printf '%s\n' "$meta"; exit 0 ;;
 esac
 
-mode=""; label=""; consoles=""; console=""
+mode=""; label=""; consoles=""; console=""; reattach=0
 while IFS= read -r line; do
   case "$line" in
     mode=*)     mode=${line#mode=} ;;
+    reattach=*) reattach=${line#reattach=} ;;
     label=*)    label=${line#label=} ;;
     consoles=*) consoles=${line#consoles=} ;;
     console=*)  console=${line#console=} ;;
@@ -142,10 +156,54 @@ if ! command -v tmux >/dev/null 2>&1; then
   exec "$proxy" "$@"
 fi
 
-# The proxy signals through a file rather than the log, and imp waits on it
-# before starting `claude` anywhere. See --ready-file in imp-proxy.
-ready_dir=$(mktemp -d "${TMPDIR:-/tmp}/imp.XXXXXX")
-ready="$ready_dir/ready"
+session="imp-$label"
+
+# `failed`, not `on`. Ctrl-C is imp-proxy's clean exit -- it tears down and
+# returns 0 -- so the window closes with it and you are left with the
+# consoles, which is the whole shape of revoking. A proxy that dies for a
+# reason exits non-zero and its window stays put, reason still on screen.
+#
+# Pane options need tmux 3.0 and the `failed` value 3.2; older tmux falls back
+# to keeping every dead pane, and older still does without.
+proxy_pane_options() {
+  local win=$1
+  tmux set-option -p -t "$win" remain-on-exit failed 2>/dev/null \
+    || tmux set-option -p -t "$win" remain-on-exit on 2>/dev/null \
+    || true
+}
+
+# Ctrl-B C-n / C-p: step one window, and step again if that landed on the
+# proxy. Both keys are unbound in tmux's default prefix table. Bindings are
+# server-global -- there is no session-local key table -- so this is written
+# to be harmless in your other sessions: it is next-window/previous-window
+# that happens to skip windows named `imp:*`, and nothing else has that name.
+# The whole chain has to arrive as one argument. A bare `;` between them is
+# read by tmux as the separator between two *top-level* commands, so
+# `bind-key ... select-window ; if-shell ...` binds only the select-window
+# and runs the if-shell once, immediately, at bind time -- a binding that
+# looks right in list-keys until you notice it is half as long as it should
+# be, and lands on the proxy every third press.
+bind_step_keys() {
+  local k key step
+  for k in 'C-n :+' 'C-p :-'; do
+    key=${k%% *}; step=${k##* }
+    tmux bind-key -T prefix "$key" \
+      "select-window -t $step ; if-shell -F '#{m:imp:*,#{window_name}}' 'select-window -t $step'" \
+      2>/dev/null || true
+  done
+}
+
+# When the last console closes, take the proxy down with it. Ctrl-C in the
+# proxy window is the other direction and must not trigger this, which is why
+# the reaper counts `claude:` windows rather than watching any single pane.
+#
+# Single quotes for tmux, double quotes for the shell inside them, so a
+# checkout path with a space in it survives both parsers.
+arm_reaper() {
+  local win=$1
+  tmux set-hook -t "$win" window-unlinked \
+    "run-shell -b '\"$here/imp\" --reap $label $win'" 2>/dev/null || true
+}
 
 # tmux wants one command string, so the passthrough has to survive being
 # re-parsed by a shell. printf %q is what makes that safe rather than hopeful.
@@ -159,9 +217,72 @@ ready="$ready_dir/ready"
 # anyway, wearing a dead pane. exec makes the pane process imp-proxy
 # everywhere, so the signal and the exit status are always its own.
 cmd="exec $(printf '%q' "$proxy")"
+# The same arguments without --reattach, for the one message that has to name
+# the command that would have built this session. `--rea` is as short as
+# argparse lets that option be abbreviated -- `--re` is ambiguous with
+# --remote-port -- so that is what the pattern matches.
+plain=""
 for arg in "$@"; do
   cmd="$cmd $(printf '%q' "$arg")"
+  case "$arg" in --rea*) continue ;; esac
+  plain="$plain $(printf '%q' "$arg")"
 done
+
+# --reattach: the consoles outlived their proxy, and they are the expensive
+# half -- three claudes with three conversations in them. So nothing here
+# creates or types into a console. It hangs a proxy window back on the front
+# of the session and gets out of the way; imp-proxy does the part that
+# matters, which is handing the far side the capability those claudes are
+# still holding in their environment.
+if [ "$reattach" != 0 ]; then
+  tmux has-session -t "=$session" 2>/dev/null \
+    || die "no session '$session' to reattach to -- open one with: imp$plain"
+
+  # No pipe into `grep -q`, for the reason spelled out in the reaper: under
+  # pipefail, grep exiting at the first match reads as tmux having failed.
+  names=$(tmux list-windows -t "=$session" -F '#{window_name}' 2>/dev/null || true)
+  if grep -qx "imp:$label" <<EOF
+$names
+EOF
+  then
+    printf 'imp: %s already has a proxy window -- nothing to put back.\n' \
+           "$session" >&2
+  else
+    # In front of the first console, where the proxy was. Ctrl-B C-n knows it
+    # by name and would step over it at any index, but a session that comes
+    # back in a different order than it left is one you have to re-read.
+    # -b wants tmux 3.2; without it the window lands at the end, which is a
+    # session that works and reads slightly wrong.
+    first=$(tmux list-windows -t "=$session" -F '#{window_id} #{window_name}' \
+            | awk -v want="claude:$label" '$2 == want { print $1; exit }')
+    win=""
+    if [ -n "$first" ]; then
+      win=$(tmux new-window -b -t "$first" -P -F '#{window_id}' \
+            -n "imp:$label" "$cmd" 2>/dev/null) || win=""
+    fi
+    if [ -z "$win" ]; then
+      win=$(tmux new-window -t "=$session" -P -F '#{window_id}' \
+            -n "imp:$label" "$cmd") || die "tmux could not open a window"
+    fi
+    proxy_pane_options "$win"
+    bind_step_keys
+    arm_reaper "$win"
+  fi
+
+  # Attached to nothing if someone is already looking. The way a session
+  # loses its proxy is a Ctrl-C in a window you are still sitting in, and
+  # answering that by stealing whichever terminal `imp` was typed into --
+  # possibly the one running the claude that suggested this -- is not a fix.
+  [ -z "${TMUX:-}" ] || exit 0
+  clients=$(tmux list-clients -t "=$session" -F '#{client_name}' 2>/dev/null || true)
+  [ -z "$clients" ] || exit 0
+  exec tmux attach -t "=$session"
+fi
+
+# The proxy signals through a file rather than the log, and imp waits on it
+# before starting `claude` anywhere. See --ready-file in imp-proxy.
+ready_dir=$(mktemp -d "${TMPDIR:-/tmp}/imp.XXXXXX")
+ready="$ready_dir/ready"
 cmd="$cmd --ready-file $(printf '%q' "$ready")"
 
 # The proxy takes the first window; the consoles follow it, so the `claude:`
@@ -173,7 +294,6 @@ if [ -n "${TMUX:-}" ]; then
         -n "imp:$label" "$cmd") || die "tmux could not open a window"
   attach=""
 else
-  session="imp-$label"
   if ! win=$(tmux new-session -d -s "$session" -P -F '#{window_id}' \
              -n "imp:$label" "$cmd" 2>/dev/null); then
     die "tmux session '$session' already exists -- try: tmux attach -t $session"
@@ -182,16 +302,7 @@ else
 fi
 [ -n "$win" ] || die "tmux did not name the window it opened"
 
-# `failed`, not `on`. Ctrl-C is imp-proxy's clean exit -- it tears down and
-# returns 0 -- so the window closes with it and you are left with the
-# consoles, which is the whole shape of revoking. A proxy that dies for a
-# reason exits non-zero and its window stays put, reason still on screen.
-#
-# Pane options need tmux 3.0 and the `failed` value 3.2; older tmux falls back
-# to keeping every dead pane, and older still does without.
-tmux set-option -p -t "$win" remain-on-exit failed 2>/dev/null \
-  || tmux set-option -p -t "$win" remain-on-exit on 2>/dev/null \
-  || true
+proxy_pane_options "$win"
 
 # The consoles. All share one window name: the reaper counts them by it, and
 # Ctrl-B C-n tells them from the proxy by it, so it is load-bearing. -n turns
@@ -214,32 +325,8 @@ done
 tmux select-window -t "$win" 2>/dev/null || true
 tmux select-window -t :+ 2>/dev/null || true
 
-# Ctrl-B C-n / C-p: step one window, and step again if that landed on the
-# proxy. Both keys are unbound in tmux's default prefix table. Bindings are
-# server-global -- there is no session-local key table -- so this is written
-# to be harmless in your other sessions: it is next-window/previous-window
-# that happens to skip windows named `imp:*`, and nothing else has that name.
-# The whole chain has to arrive as one argument. A bare `;` between them is
-# read by tmux as the separator between two *top-level* commands, so
-# `bind-key ... select-window ; if-shell ...` binds only the select-window
-# and runs the if-shell once, immediately, at bind time -- a binding that
-# looks right in list-keys until you notice it is half as long as it should
-# be, and lands on the proxy every third press.
-for k in 'C-n :+' 'C-p :-'; do
-  key=${k%% *}; step=${k##* }
-  tmux bind-key -T prefix "$key" \
-    "select-window -t $step ; if-shell -F '#{m:imp:*,#{window_name}}' 'select-window -t $step'" \
-    2>/dev/null || true
-done
-
-# When the last console closes, take the proxy down with it. Ctrl-C in the
-# proxy window is the other direction and must not trigger this, which is why
-# the reaper counts `claude:` windows rather than watching any single pane.
-#
-# Single quotes for tmux, double quotes for the shell inside them, so a
-# checkout path with a space in it survives both parsers.
-tmux set-hook -t "$win" window-unlinked \
-  "run-shell -b '\"$here/imp\" --reap $label $win'" 2>/dev/null || true
+bind_step_keys
+arm_reaper "$win"
 
 # `claude` last, and only once the proxy says the far side is funded: it reads
 # settings.json at startup, and imp-proxy is still writing it for the first

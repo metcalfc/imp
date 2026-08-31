@@ -32,6 +32,16 @@ leaving the consoles you were working in, now unfunded. Closing the last
 console revokes too, and ends the session. The sprite never held anything
 worth stealing.
 
+If that Ctrl-C was a mistake, put the proxy back beside the consoles that
+outlived it:
+
+```
+imp -s my-sprite --reattach
+```
+
+They are funded again where they are, mid-conversation, rather than restarted
+— see [Ctrl-C you did not mean](#ctrl-c-you-did-not-mean).
+
 `-n` changes how many consoles you get:
 
 ```
@@ -258,7 +268,8 @@ stateDiagram-v2
 
 There is no watchdog racing a live secret, and no teardown that has to succeed.
 Revocation is the *absence* of the proxy. Running `claude` processes on the
-sprite simply start failing API calls; reconnect and they resume.
+sprite simply start failing API calls; reconnect and they resume — which is
+literal, and is [the next section](#ctrl-c-you-did-not-mean).
 
 Verified against a live sprite:
 
@@ -280,6 +291,47 @@ And against a real ssh host (`-H`, Linux, OpenSSH client, Go server):
 | Ctrl-C | `settings.json` back to `{}`, forward gone, exit 0 |
 | `claude` after Ctrl-C | `Not logged in · Please run /login` |
 | `kill -9`, no teardown, 30s later | relay gone, port freed, only an inert capability left |
+
+## Ctrl-C you did not mean
+
+Revoking and losing the proxy by accident are the same keystroke, and the
+consoles are the expensive half of a session: three claudes with three
+conversations in them, still running, now pointed at a port with nothing
+behind it.
+
+Starting another proxy does bring them back, as it turns out: a running
+`claude` re-reads `settings.json`, and three consoles picked a new session's
+capability up mid-conversation with no restart. That is a behaviour of Claude
+Code, though, not something imp can promise on its behalf — so `--reattach`
+does not lean on it. It hands back the capability those claudes already have,
+and nothing on the far side has to notice that anything changed.
+
+So `imp-proxy` writes the capability down, in
+`~/.local/state/imp/<label>-<port>.json`, mode 0600, and `--reattach` hands
+the same one back:
+
+```
+imp -s my-sprite --reattach
+```
+
+That puts a proxy window back in front of the consoles it left, in the tmux
+session they are still sitting in. It opens no console and types `claude`
+nowhere; the ones running pick the proxy up again on their next request.
+Without tmux, `imp-proxy -s my-sprite --reattach` does the funding half by
+itself.
+
+What is on disk is not a credential. It names one session, buys nothing
+without a proxy of yours listening on the far side's port, and the far side
+has held it since the moment it was minted — of everything in this design it
+is the one thing that is safe to leave lying around. It is handed back only
+when you ask, only within 24 hours, and only if it still looks like something
+imp minted; `imp-proxy --clear` takes it out along with the far side's
+pointer.
+
+| | |
+|---|---|
+| the capability | on the far side, in every `claude`'s environment, and now on your disk |
+| the credential | on your machine, in your keychain, read per request and never written down |
 
 ## Blast radius
 
@@ -490,7 +542,7 @@ but it is a broader credential than the job needs.
 
 ```
 imp-proxy [-s SPRITE | -H HOST] [-p REMOTE_PORT] [--no-settings]
-          [--allow GLOB] [--allow-any-path] [-v]
+          [--allow GLOB] [--allow-any-path] [--reattach] [-v]
 
   -s, --sprite        sprite name (default: the one `sprite use` selected in
                       this directory; without either, it exits and says so)
@@ -505,6 +557,11 @@ imp-proxy [-s SPRITE | -H HOST] [-p REMOTE_PORT] [--no-settings]
                       it, and say whether anything is still behind it
   -n, --consoles      how many console windows `imp` should open (default 3);
                       imp-proxy opens no windows itself and ignores it
+      --reattach      reuse the capability the last session on this target
+                      held, so `claude` processes still running there are
+                      funded again without a restart; `imp --reattach` also
+                      puts the proxy window back in the session it was killed
+                      out of
   -v, --verbose       log each proxied request (method, path, size)
 ```
 
