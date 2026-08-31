@@ -205,9 +205,22 @@ class Harness(object):
             if self.wait(lambda: ("imp:" + label) not in self.windows(session),
                          3.0):
                 return ""
+            # Or the proxy stopped and tmux kept the corpse. `remain-on-exit
+            # failed` keeps a pane it cannot prove succeeded, and on tmux 3.4
+            # a pane can arrive dead with neither an exit status nor a signal
+            # recorded -- seen on ubuntu runners, where the pane read
+            # `dead=1 status= sig=` after printing PROXY DOWN and exiting 0.
+            # The proxy is stopped either way, which is what revoking means;
+            # the window staying is that tmux's cosmetics, not imp's doing.
+            if "PROXY DOWN" in self.pane_text(win) and self.pane_dead(win):
+                return ""
         return ("the proxy window outlived five Ctrl-Cs: windows=%r pane=%r "
                 "text=%r" % (self.windows(session), self.pane_state(win),
                              self.pane_text(win).strip().splitlines()[-3:]))
+
+    def pane_dead(self, target):
+        r = self.tmux("list-panes", "-t", target, "-F", "#{pane_dead}")
+        return r.stdout.strip().startswith("1")
 
     def pane_state(self, target):
         """What tmux believes about a pane -- alive or dead, how it died, and
@@ -534,7 +547,9 @@ class TestEndingASession(TmuxCase):
         why = self.h.revoke_proxy()
         if why:
             self.fail(why)
-        self.assertEqual(self.h.windows(), ["claude:foo"] * 3)
+        # The consoles, all three, whatever became of the proxy's window.
+        self.assertEqual([w for w in self.h.windows() if w != "imp:foo"],
+                         ["claude:foo"] * 3)
 
 
 class TestReattach(TmuxCase):

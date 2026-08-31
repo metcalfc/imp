@@ -455,7 +455,12 @@ session="imp-$label"
 # reason exits non-zero and its window stays put, reason still on screen.
 #
 # Pane options need tmux 3.0 and the `failed` value 3.2; older tmux falls back
-# to keeping every dead pane, and older still does without.
+# to keeping every dead pane, and older still does without. And `failed` keeps
+# what it cannot prove succeeded: on tmux 3.4 a pane sometimes arrives dead
+# with neither an exit status nor a signal recorded, and a proxy that tore
+# down cleanly leaves its window behind wearing a dead pane. Cosmetic -- the
+# far side is revoked the moment the process is gone -- and closing the window
+# is the way out of it.
 proxy_pane_options() {
   local win=$1
   tmux set-option -p -t "$win" remain-on-exit failed 2>/dev/null \
