@@ -181,26 +181,44 @@ class Harness(object):
         return ids[0] if ids else None
 
     def revoke_proxy(self, label="foo", session="imp-foo"):
-        """Ctrl-C in the proxy window, the way a session loses it. True if
-        the window went.
+        """Ctrl-C in the proxy window, the way a session loses it. Empty
+        string if the window went, and why it did not otherwise.
 
         Waited for and retried, because a keystroke is not a function call.
         The proxy installs its INT handler a moment after it starts, and a
         C-c that lands before that kills the pane by signal instead -- which
         `remain-on-exit failed` rightly keeps on screen, leaving a window
-        that never closes and a test that fails on the wait rather than on
-        the thing it was about.
+        that never closes.
+
+        The reason it gives back is the pane's own state, because a window
+        that outlives five Ctrl-Cs has already stopped being about the
+        keystroke, and "False is not true" from a CI runner an ocean away is
+        not enough to say what it is about instead.
         """
         win = self.proxy_window(label, session)
-        if not win or not self.wait(
-                lambda: "PROXY READY" in self.pane_text(win)):
-            return False
+        if not win:
+            return "no proxy window in %s: %r" % (session, self.windows(session))
+        if not self.wait(lambda: "PROXY READY" in self.pane_text(win)):
+            return "the proxy never reported ready: %r" % self.pane_state(win)
         for _ in range(5):
             self.tmux("send-keys", "-t", win, "C-c")
             if self.wait(lambda: ("imp:" + label) not in self.windows(session),
                          3.0):
-                return True
-        return False
+                return ""
+        return ("the proxy window outlived five Ctrl-Cs: windows=%r pane=%r "
+                "text=%r" % (self.windows(session), self.pane_state(win),
+                             self.pane_text(win).strip().splitlines()[-3:]))
+
+    def pane_state(self, target):
+        """What tmux believes about a pane -- alive or dead, how it died, and
+        whether the option that decides if its window stays actually took."""
+        r = self.tmux("list-panes", "-t", target, "-F",
+                      "dead=#{pane_dead} status=#{pane_dead_status} "
+                      "sig=#{pane_dead_signal} pid=#{pane_pid} "
+                      "cmd=#{pane_current_command} "
+                      "remain=#{?pane_dead,-,#{window_visible_layout}} "
+                      "opt=#{remain-on-exit}")
+        return r.stdout.strip() or ("no pane: %r" % r.stderr.strip())
 
     def pane_text(self, target):
         r = self.tmux("capture-pane", "-p", "-t", target)
@@ -513,9 +531,8 @@ class TestEndingASession(TmuxCase):
 
     def test_the_proxy_exiting_leaves_the_consoles_running(self):
         # Ctrl-C in the proxy window is a clean exit: revoke, keep working.
-        self.assertTrue(self.h.revoke_proxy(),
-                        "the proxy window outlived Ctrl-C: %r"
-                        % (self.h.windows(),))
+        why = self.h.revoke_proxy()
+        self.assertEqual(why, "", why)
         self.assertEqual(self.h.windows(), ["claude:foo"] * 3)
 
 
@@ -529,9 +546,8 @@ class TestReattach(TmuxCase):
     """
 
     def revoke(self):
-        self.assertTrue(self.h.revoke_proxy(),
-                        "the proxy window outlived Ctrl-C: %r"
-                        % (self.h.windows(),))
+        why = self.h.revoke_proxy()
+        self.assertEqual(why, "", why)
 
     def setUp(self):
         TmuxCase.setUp(self)
