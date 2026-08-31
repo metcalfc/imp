@@ -853,8 +853,16 @@ class TestMeter(TmuxCase):
         # It costs a fork rather than a round trip, so this is not about
         # cost: a number recomputed on every draw moves on every draw, and a
         # bar that never sits still is one you keep reading.
-        first = self.meter()
-        self.assertEqual([self.meter() for _ in range(3)], [first] * 3)
+        #
+        # The local field only. The sprite's is allowed to change between
+        # draws and does -- the first sample lands somewhere in here, taking
+        # `spr ..%` to `spr 50%`, which is the meter working rather than
+        # moving about.
+        def mac():
+            return re.search(r"mac\s+\d+%", self.meter()).group(0)
+
+        first = mac()
+        self.assertEqual([mac() for _ in range(3)], [first] * 3)
 
     def test_a_written_down_local_number_is_the_one_shown(self):
         path = self.local_cache()
