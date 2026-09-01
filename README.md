@@ -163,6 +163,9 @@ flowchart TB
     class SJ,RL,CC inert
 ```
 
+That is the sprite transport (`-s`); `-H` is the same picture with ssh's own
+`-R` where the mux and relay are — [below](#two-transports).
+
 🔴 holds the real credential · 🟢 holds nothing worth stealing
 
 **Red never crosses a boundary.** The thick edge — the only one carrying the
@@ -180,6 +183,37 @@ directions (verified: 256KB round-tripped byte-identical).
 relay exists to work around. That path skips the relay entirely — no framing, no
 mux, no idle watchdog, and nothing for the far side to run but `echo` and `cat`.
 Add `--no-settings` and it needs no `python3` either.
+
+```mermaid
+flowchart TB
+    subgraph home["🖥️  Your machine — trusted"]
+        direction LR
+        KC[("keychain<br/><b>real Max token</b>")]
+        PX["<b>injecting proxy</b><br/>127.0.0.1:random<br/>loopback only"]
+        KC -->|"read at start,<br/>re-read on 401"| PX
+    end
+
+    API[("api.anthropic.com")]
+
+    subgraph box["🖥️  Your other host — untrusted all the same"]
+        direction LR
+        CC["claude"]
+        SJ["settings.json<br/><i>base URL + capability</i>"]
+        CC -.->|reads| SJ
+    end
+
+    PX ==>|"<b>the real credential</b><br/>Authorization: Bearer sk-ant-oat01-…"| API
+    CC <-->|"ssh -R 127.0.0.1:8080 → the proxy<br/><b>no relay, no mux, no framing</b>"| PX
+
+    classDef secret fill:#7f1d1d,stroke:#ef4444,color:#fff
+    classDef inert fill:#14532d,stroke:#22c55e,color:#fff
+    class KC,PX secret
+    class SJ,CC inert
+```
+
+Same two colours, same boundary, one fewer moving part: `:8080` on the far
+side is ssh's own listener rather than a process of ours holding the port,
+and nothing of imp's runs there but the `cat` that keeps the link open.
 
 Two options carry the properties the relay had by construction:
 
@@ -218,6 +252,7 @@ sequenceDiagram
     Note right of C: no oauth-2025-04-20 —<br/>Claude Code drops it when it<br/>has no local credentials
     R->>M: framed DATA over ssh stdio
     M->>P: replayed onto loopback
+    Note over R,M: with -H there is no relay and no mux —<br/>ssh -R carries these two hops itself
 
     rect rgba(127,29,29,0.25)
         P->>P: path on the allowlist?
@@ -252,7 +287,7 @@ stateDiagram-v2
 
     Active --> Idle: Ctrl-C
     Active --> Orphaned: link drops / kill -9
-    Orphaned --> Idle: relay watchdog<br/>30s of silence
+    Orphaned --> Idle: relay watchdog, 30s silent (-s)<br/>ssh gives up on the dead link (-H)
 
     note right of Idle
         On the sprite: nothing.
@@ -267,8 +302,8 @@ stateDiagram-v2
     end note
 
     note right of Orphaned
-        Relay still holds :8080,
-        but the far end is gone.
+        The far side still holds :8080,
+        but the near end is gone.
         Capability is inert —
         nothing accepts it.
     end note
@@ -298,7 +333,7 @@ And against a real ssh host (`-H`, Linux, OpenSSH client, Go server):
 | settings.json installed | base URL + capability, written over a second ssh |
 | Ctrl-C | `settings.json` back to `{}`, forward gone, exit 0 |
 | `claude` after Ctrl-C | `Not logged in · Please run /login` |
-| `kill -9`, no teardown, 30s later | relay gone, port freed, only an inert capability left |
+| `kill -9`, no teardown, 30s later | forward gone, port freed, only an inert capability left |
 
 ## Ctrl-C you did not mean
 
