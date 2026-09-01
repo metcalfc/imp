@@ -16,8 +16,8 @@ stdio channel, which is 8-bit clean in both directions (verified).
     ------------------------------------------------------------
     injecting proxy  <--+            +--> claude
       (real token)      |            |    ANTHROPIC_BASE_URL=
-                        |            |    http://127.0.0.1:8080
-                  demux |            | relay listens :8080
+                        |            |    http://127.0.0.1:22376
+                  demux |            | relay listens :22376
                         +-- ssh stdio +
                             (framed, multiplexed)
 
@@ -64,6 +64,16 @@ DEFAULT_ALLOWED = (
     "/v1/models",
     "/v1/models/*",
 )
+
+# The port the far side listens on. Nothing but `claude` and imp ever dials
+# it -- it is on that machine's loopback, reached only through our own ssh --
+# so the only property that matters is that nothing else there wants it.
+# 8080, which this was, is the first port a dev server takes, and a taken
+# port is a relay that cannot bind or a -R that silently has no proxy behind
+# it. This one is a random pick from the range above the dev-server crowd and
+# below Linux's ephemeral ports, so neither a service nor an outbound socket
+# is likely to have it first. Nothing depends on the number; -p changes it.
+DEFAULT_REMOTE_PORT = 22376
 
 HDR = struct.Struct("!IBI")
 T_OPEN, T_DATA, T_CLOSE, T_PING = 1, 2, 3, 4
@@ -1148,7 +1158,7 @@ class SSHTarget(object):
         return ["ssh"] + SSH_COMMON + [self.dest, remote_cmd]
 
     def link_argv(self, remote_port, local_port):
-        # 127.0.0.1 spelled out on both ends. `-R 8080:...` binds 0.0.0.0 on
+        # 127.0.0.1 spelled out on both ends. `-R 22376:...` binds 0.0.0.0 on
         # a host configured with GatewayPorts yes, which would put the
         # capability endpoint on the network -- the one way this transport
         # can be less careful than the relay, which only ever binds loopback.
@@ -1498,8 +1508,10 @@ def main():
     ap.add_argument("-H", "--host", default="",
                     help="an ssh destination instead of a sprite -- anything "
                          "`ssh` accepts, including a Host from your ssh config")
-    ap.add_argument("-p", "--remote-port", type=port_arg, default=8080,
-                    help="port to listen on at the far end (default 8080)")
+    ap.add_argument("-p", "--remote-port", type=port_arg,
+                    default=DEFAULT_REMOTE_PORT,
+                    help="port to listen on at the far end (default %d)"
+                         % DEFAULT_REMOTE_PORT)
     ap.add_argument("--no-settings", action="store_true",
                     help="do not touch the far side's ~/.claude/settings.json; "
                          "print the env vars for you to set yourself")

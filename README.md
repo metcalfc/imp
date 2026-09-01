@@ -147,7 +147,7 @@ flowchart TB
 
     subgraph vm["☁️  Sprite — untrusted"]
         direction LR
-        RL["relay<br/>127.0.0.1:8080"]
+        RL["relay<br/>127.0.0.1:22376"]
         CC["claude"]
         SJ["settings.json<br/><i>base URL + capability</i>"]
         RL <--> CC
@@ -177,6 +177,13 @@ nor `-A`. So the tunnel is a userspace reimplementation of remote forwarding,
 multiplexed over the one ssh stdio channel, which is 8-bit clean in both
 directions (verified: 256KB round-tripped byte-identical).
 
+`:22376` is a port on the far side's loopback that only `claude` and imp
+ever dial, so the one property that matters is that nothing else over there
+wants it. It is a random pick from above the dev-server range and below
+Linux's ephemeral ports; it used to be `8080`, which is the first port a dev
+server takes, and a port already in use is a relay that cannot bind or a
+`-R` that silently has no proxy behind it. `-p` changes it.
+
 ### Two transports
 
 `-H` targets a host that speaks ordinary ssh, where `-R` does natively what the
@@ -203,7 +210,7 @@ flowchart TB
     end
 
     PX ==>|"<b>the real credential</b><br/>Authorization: Bearer sk-ant-oat01-…"| API
-    CC <-->|"ssh -R 127.0.0.1:8080 → the proxy<br/><b>no relay, no mux, no framing</b>"| PX
+    CC <-->|"ssh -R 127.0.0.1:22376 → the proxy<br/><b>no relay, no mux, no framing</b>"| PX
 
     classDef secret fill:#7f1d1d,stroke:#ef4444,color:#fff
     classDef inert fill:#14532d,stroke:#22c55e,color:#fff
@@ -211,7 +218,7 @@ flowchart TB
     class SJ,CC inert
 ```
 
-Same two colours, same boundary, one fewer moving part: `:8080` on the far
+Same two colours, same boundary, one fewer moving part: `:22376` on the far
 side is ssh's own listener rather than a process of ours holding the port,
 and nothing of imp's runs there but the `cat` that keeps the link open.
 
@@ -219,7 +226,7 @@ Two options carry the properties the relay had by construction:
 
 | | |
 |---|---|
-| `-R 127.0.0.1:PORT:127.0.0.1:PORT` | spelled out. `-R 8080:…` binds `0.0.0.0` wherever `GatewayPorts yes` is set, which would put the capability endpoint on the network |
+| `-R 127.0.0.1:PORT:127.0.0.1:PORT` | spelled out. `-R 22376:…` binds `0.0.0.0` wherever `GatewayPorts yes` is set, which would put the capability endpoint on the network |
 | `ExitOnForwardFailure=yes` | otherwise a taken remote port is a warning and a session that silently has no proxy behind it — the relay reports that by failing to bind and never pinging |
 
 Host key checking is left alone for `-H`. Off is right for the sprite, whose
@@ -230,7 +237,7 @@ Not every host that gives you a shell gives you `-R` — a Go-based ssh server
 often implements no remote forwarding at all. One command settles it:
 
 ```sh
-ssh -R 127.0.0.1:8080:127.0.0.1:9 -o ExitOnForwardFailure=yes HOST 'echo FORWARD_OK'
+ssh -R 127.0.0.1:22376:127.0.0.1:9 -o ExitOnForwardFailure=yes HOST 'echo FORWARD_OK'
 ```
 
 ## What crosses the boundary, per request
@@ -302,7 +309,7 @@ stateDiagram-v2
     end note
 
     note right of Orphaned
-        The far side still holds :8080,
+        The far side still holds :22376,
         but the near end is gone.
         Capability is inert —
         nothing accepts it.
@@ -388,7 +395,7 @@ flowchart TB
     N1 --> N2["Disk / checkpoints: nothing"]
     N2 --> N3(["<b>Zero</b> — no credential exists<br/>on the box to steal"])
 
-    Q -->|"Yes"| Y1["Can call your Max subscription<br/>via 127.0.0.1:8080 —<br/><i>inference endpoints only</i>"]
+    Q -->|"Yes"| Y1["Can call your Max subscription<br/>via 127.0.0.1:22376 —<br/><i>inference endpoints only</i>"]
     Y1 --> Y2["Cannot extract the token —<br/>it is not on the machine"]
     Y2 --> Y3["Cannot use it off-box —<br/>capability only works<br/>through your loopback"]
     Y3 --> Y4(["Bounded by your session,<br/>ends when you Ctrl-C"])
@@ -643,7 +650,7 @@ imp-proxy [-s SPRITE | -H HOST] [-p REMOTE_PORT] [--no-settings]
                       this directory; without either, it exits and says so)
   -H, --host          an ssh destination instead of a sprite -- anything ssh
                       accepts, including a Host from your ssh config
-  -p, --remote-port   port to listen on at the far end (default 8080)
+  -p, --remote-port   port to listen on at the far end (default 22376)
       --no-settings   don't touch the far side's settings.json; print the env
                       vars and set them yourself
       --allow GLOB    allow an extra request path through; repeatable
